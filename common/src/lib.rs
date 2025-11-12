@@ -126,7 +126,7 @@ pub fn send_message_tcp(
 }
 
 pub fn read_message_tcp(stream: &mut BufReaderDirectWriter<TcpStream>) -> io::Result<String> {
-    let mut buffer = String::with_capacity(72);
+    let mut buffer = String::with_capacity(110);
     let bytes_read = stream.read_line(&mut buffer)?;
     buffer.truncate(bytes_read);
     Ok(buffer)
@@ -299,6 +299,9 @@ impl NetworkEndpoint {
                     ka = ka.with_time(Duration::from_secs(30));
                     ka = ka.with_interval(Duration::from_secs(30));
                     sock_ref.set_tcp_keepalive(&ka)?;
+
+                    sock_ref.set_read_timeout(Some(Duration::from_secs(30)))?;
+                    sock_ref.set_write_timeout(Some(Duration::from_secs(30)))?;
 
                     log::info!("{}: Connected to {}", key, self);
                     let writer = BufReaderDirectWriter::new(stream);

@@ -10,6 +10,9 @@ pub struct Persistence {
 
 #[allow(dead_code)]
 impl Persistence {
+    pub const NEXT_KEY_VALUE: [u8; 1] = [0];
+    const INITIAL_KEY_VALUE: [u8; 8] = [0; 8];
+
     pub fn new(cache_dir: &str) -> Self {
         let database_path = PathBuf::from(cache_dir);
         if !database_path.exists() {
@@ -17,11 +20,17 @@ impl Persistence {
         }
 
         let db: Db = sled::Config::default()
-            .cache_capacity(500_000)
+            .cache_capacity(5_000)
             .path(&database_path)
             .open()
             .expect(format!("Cannot open database {}", database_path.display()).as_str());
-        let count = db.len();
+
+        let next_key = db.get(&Self::NEXT_KEY_VALUE).unwrap();
+        if next_key.is_none() {
+            db.insert(&Self::NEXT_KEY_VALUE, &Self::INITIAL_KEY_VALUE)
+                .unwrap();
+        }
+        let count = db.len() - 1;
 
         let this = Persistence { db, count };
 
@@ -67,5 +76,38 @@ impl Persistence {
 
     pub fn count(&self) -> usize {
         self.count
+    }
+
+    pub fn next_key(&mut self) -> u64 {
+        match self
+            .db
+            .update_and_fetch(&Self::NEXT_KEY_VALUE, increment)
+            .unwrap()
+        {
+            Some(n) => iv_to_u64(n).unwrap(),
+            None => 0,
+        }
+    }
+}
+
+fn increment(old: Option<&[u8]>) -> Option<Vec<u8>> {
+    let number = match old {
+        Some(bytes) => {
+            let array: [u8; 8] = bytes.try_into().unwrap();
+            let number = u64::from_be_bytes(array);
+            number + 1
+        }
+        None => 1,
+    };
+
+    Some(number.to_be_bytes().to_vec())
+}
+
+fn iv_to_u64(iv: IVec) -> Option<u64> {
+    if iv.len() == 8 {
+        let bytes: [u8; 8] = iv.as_ref().try_into().ok()?;
+        Some(u64::from_be_bytes(bytes)) // or from_le_bytes(bytes) based on your data
+    } else {
+        None // Return None if the length is not 8
     }
 }

@@ -3,7 +3,6 @@ use config::Config;
 use env_logger::Env;
 use nmea_parser::ParsedMessage;
 use std::collections::HashMap;
-use std::net::UdpSocket;
 use std::ops::Add;
 use std::path::PathBuf;
 use std::process::exit;
@@ -13,10 +12,6 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{io, path};
 
 use common::NetworkEndpoint;
-use common::Protocol;
-use common::buffer::BufReaderDirectWriter;
-use common::send_message_tcp;
-use common::send_message_udp;
 
 mod cache;
 mod location;
@@ -43,6 +38,10 @@ struct Dispatcher {
     nmea_parser: nmea_parser::NmeaParser,
     last_sent: HashMap<u32, LastSent>,
     last_sent_location: SystemTime,
+    prev_latitude: Option<f64>,
+    prev_longitude: Option<f64>,
+    doubtful_latitude: Option<f64>,
+    doubtful_longitude: Option<f64>,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -165,6 +164,17 @@ fn main() {
             exit(1);
         }
     };
+    let location_retry_interval = match general
+        .get("location_retry_interval")
+        .map(|v| v.parse::<u64>())
+    {
+        None => 600,
+        Some(Ok(interval)) => interval,
+        Some(Err(e)) => {
+            log::error!("Invalid location_retry_interval in config.ini: {}", e);
+            exit(1);
+        }
+    };
 
     let (tx, rx) = std::sync::mpsc::channel::<ParsedMessage>();
     let location = match settings.get("location") {
@@ -189,7 +199,13 @@ fn main() {
     Builder::new()
         .name("location".to_string())
         .spawn(move || {
-            location::work_thread(rx, location, mmsi, cli.cache_dir.as_str());
+            location::work_thread(
+                rx,
+                location,
+                mmsi,
+                cli.cache_dir.as_str(),
+                location_retry_interval,
+            );
         })
         .unwrap();
 
@@ -264,6 +280,10 @@ impl Dispatcher {
             nmea_parser: nmea_parser::NmeaParser::new(),
             last_sent: HashMap::new(),
             last_sent_location: SystemTime::now() - Duration::from_secs(location_interval),
+            prev_latitude: None,
+            prev_longitude: None,
+            doubtful_latitude: None,
+            doubtful_longitude: None,
         }
     }
 
@@ -298,26 +318,20 @@ impl Dispatcher {
 
         let mut fragments = Vec::new();
         let mut last_seen_rmc_message = SystemTime::UNIX_EPOCH;
-        let mut prev_lat = 0.0;
-        let mut prev_long = 0.0;
         let now = SystemTime::now();
         let mut next_location_ts = self.next_location_system_time(&now);
         let mut next_location_anchor_ts = self.next_location_anchor_system_time(&now);
 
         loop {
-            log::trace!("Waiting for message from provider");
             let message = self.provider.read_to_string()?;
-            log::trace!("Received message: {}", message);
 
             for line in message.lines() {
-                log::trace!("Received line: {}", line);
                 match self.nmea_parser.parse_sentence(line) {
                     Ok(parsed_message) => {
                         if parsed_message == ParsedMessage::Incomplete {
                             fragments.push(line.to_string());
                             continue;
                         }
-                        log::debug!("Parsed message: {:?}", parsed_message);
                         let now = SystemTime::now();
 
                         if let (Some(own_vessel), lat, long) = match &parsed_message {
@@ -342,38 +356,38 @@ impl Dispatcher {
                             _ => (None, None, None),
                         } {
                             fragments.push(line.to_string());
-                            // Ignore messages with no position or at (0, 0) coordinates
-                            if let (Some(lat), Some(long)) = (lat, long) {
-                                log::trace!("Parsed position: lat: {}, long: {}", lat, long);
-                                if lat != 0.0 || long != 0.0 {
-                                    if self.check_last_sent(&parsed_message) {
-                                        self.broadcast_ais(
-                                            &parsed_message,
-                                            fragments.join("").as_bytes(),
-                                        )?;
-                                    }
-                                    if own_vessel {
-                                        log::trace!(
-                                            "Compare last sent location: {:?} interval {:?} anchor {:?}",
-                                            now,
-                                            next_location_ts,
-                                            next_location_anchor_ts,
-                                        );
-                                        if now >= next_location_anchor_ts
-                                            || (now >= next_location_ts
-                                                && is_moving(lat, long, prev_lat, prev_long))
-                                        {
-                                            prev_lat = lat;
-                                            prev_long = long;
-                                            self.last_sent_location = now;
-                                            self.location_tx.send(parsed_message).unwrap();
-                                            next_location_ts = self.next_location_system_time(&now);
-                                            next_location_anchor_ts =
-                                                self.next_location_anchor_system_time(&now);
-                                        }
-                                    }
+
+                            if self.check_last_sent(&parsed_message) {
+                                self.broadcast_ais(&parsed_message, fragments.join("").as_bytes())?;
+                            }
+
+                            if own_vessel && self.validate_position(lat, long) {
+                                log::trace!(
+                                    "Compare last sent location: {:?} interval {:?} anchor {:?}",
+                                    now,
+                                    next_location_ts,
+                                    next_location_anchor_ts,
+                                );
+                                if now >= next_location_anchor_ts
+                                    || (now >= next_location_ts
+                                        && is_moving(
+                                            lat.unwrap(),
+                                            long.unwrap(),
+                                            self.prev_latitude,
+                                            self.prev_longitude,
+                                        ))
+                                {
+                                    self.prev_latitude = lat;
+                                    self.prev_longitude = long;
+                                    self.last_sent_location = now;
+                                    log::debug!("Sending location: {:?}", parsed_message);
+                                    self.location_tx.send(parsed_message).unwrap();
+                                    next_location_ts = self.next_location_system_time(&now);
+                                    next_location_anchor_ts =
+                                        self.next_location_anchor_system_time(&now);
                                 }
                             }
+
                             fragments.clear();
                         }
                     }
@@ -386,9 +400,9 @@ impl Dispatcher {
     }
 
     fn broadcast_ais(&mut self, message: &ParsedMessage, nmea_message: &[u8]) -> io::Result<()> {
-        log::debug!("Broadcasting message: {:?} / {:?}", message, nmea_message);
+        log::trace!("Broadcasting message: {:?} / {:?}", message, nmea_message);
         for (key, address) in self.ais.iter_mut() {
-            send_message(&nmea_message, key, address)?;
+            address.send_message(&nmea_message, key)?;
         }
         Ok(())
     }
@@ -405,14 +419,14 @@ impl Dispatcher {
                 let elapsed_secs = now.duration_since(last_sent.vessel_dynamic_data).as_secs();
                 if elapsed_secs >= self.interval {
                     last_sent.vessel_dynamic_data = now;
-                    log::debug!(
+                    log::trace!(
                         "Sending dynamic data for MMSI {} as we last sent it {} seconds ago",
                         data.mmsi,
                         elapsed_secs
                     );
                     return true;
                 }
-                log::debug!(
+                log::trace!(
                     "Skipping dynamic data for MMSI {} as we last sent it {} seconds ago",
                     data.mmsi,
                     elapsed_secs
@@ -428,104 +442,87 @@ impl Dispatcher {
                 let elapsed_secs = now.duration_since(last_sent.vessel_static_data).as_secs();
                 if elapsed_secs >= self.interval {
                     last_sent.vessel_static_data = now;
-                    log::debug!(
+                    log::trace!(
                         "Sending static data for MMSI {} as we last sent it {} seconds ago",
                         data.mmsi,
                         elapsed_secs
                     );
                     return true;
                 }
-                log::debug!(
+                log::trace!(
                     "Skipping static data for MMSI {} as we last sent it {} seconds ago",
                     data.mmsi,
                     elapsed_secs
                 );
             }
-            _ => {
-                log::debug!("Ignoring message: {:?}", message);
-            }
+            _ => {}
         }
         return false;
     }
-}
 
-fn is_moving(lat: f64, long: f64, prev_lat: f64, prev_long: f64) -> bool {
-    let lat_diff = (lat - prev_lat).abs();
-    let long_diff = (long - prev_long).abs();
-
-    lat_diff > 0.001 || long_diff > 0.001
-}
-
-fn send_message(
-    nmea_message: &[u8],
-    key: &String,
-    address: &mut NetworkEndpoint,
-) -> io::Result<()> {
-    match address.protocol {
-        Protocol::TCP => {
-            address.tcp_stream.retain(|writer| {
-                if writer.peer_addr().is_err() {
-                    log::warn!("Removing disconnected TCP stream");
-                    false
+    fn validate_position(&mut self, latitude: Option<f64>, longitude: Option<f64>) -> bool {
+        if latitude.is_none() || longitude.is_none() {
+            log::warn!("Invalid position: latitude or longitude is None");
+            return false;
+        }
+        let latitude = latitude.unwrap();
+        let longitude = longitude.unwrap();
+        let latitude_abs = latitude.abs();
+        let longitude_abs = longitude.abs();
+        if latitude_abs > 90.0 || longitude_abs > 180.0 {
+            log::warn!("Invalid position: latitude or longitude out of range");
+            return false;
+        }
+        if latitude_abs < 0.01 || longitude_abs < 0.01 {
+            log::warn!("Invalid position: latitude and longitude are too close to zero");
+            return false;
+        }
+        if let Some(prev_latitude) = self.prev_latitude {
+            if (latitude - prev_latitude).abs() >= 2.00 {
+                if let Some(doubtful_latitude) = self.doubtful_latitude {
+                    if (latitude - doubtful_latitude).abs() >= 2.00 {
+                        log::warn!("Doubtful position: latitude change is too big");
+                        self.doubtful_latitude = Some(latitude);
+                        return false;
+                    }
                 } else {
-                    true
+                    log::warn!("Invalid position: latitude change is too big");
+                    self.doubtful_latitude = Some(latitude);
+                    return false;
                 }
-            });
-
-            if address.tcp_stream.len() == 0 {
-                let stream = std::net::TcpStream::connect(address.addr).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("{} ({}): {}", key, address.addr, e),
-                    )
-                })?;
-
-                // Set the stream to use keepalive
-                let sock_ref = socket2::SockRef::from(&stream);
-                let mut ka = socket2::TcpKeepalive::new();
-                ka = ka.with_time(Duration::from_secs(30));
-                ka = ka.with_interval(Duration::from_secs(30));
-                sock_ref.set_tcp_keepalive(&ka)?;
-
-                log::info!("{}: Connected to {}", key, address);
-                let writer = BufReaderDirectWriter::new(stream);
-                address.tcp_stream.push(writer);
-            }
-            if let Some(tcp_stream) = address.tcp_stream.get_mut(0) {
-                send_message_tcp(tcp_stream, nmea_message).map_err(|e| {
-                    address.tcp_stream.clear();
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("send_message tcp {} ({}): {}", key, address.addr, e),
-                    )
-                })?;
-                log::debug!("{}: Sent message to {}", key, address);
             }
         }
-        Protocol::UDP => {
-            if address.udp_socket.is_none() {
-                let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("{} ({}): {}", key, address.addr, e),
-                    )
-                })?;
-                UdpSocket::connect(&socket, address.addr)?;
-                log::info!("{}: Connected to {}", key, address);
-                address.udp_socket = Some(socket);
-            }
-            if let Some(udp_socket) = address.udp_socket.as_mut() {
-                send_message_udp(udp_socket, nmea_message).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("send_message udp {} ({}): {}", key, address.addr, e),
-                    )
-                })?;
+        if let Some(prev_longitude) = self.prev_longitude {
+            if (longitude - prev_longitude).abs() >= 2.00 {
+                if let Some(doubtful_longitude) = self.doubtful_longitude {
+                    if (longitude - doubtful_longitude).abs() >= 2.00 {
+                        log::warn!("Doubtful position: longitude change is too big");
+                        self.doubtful_longitude = Some(longitude);
+                        return false;
+                    }
+                } else {
+                    log::warn!("Invalid position: longitude change is too big");
+                    self.doubtful_longitude = Some(longitude);
+                    return false;
+                }
             }
         }
-        Protocol::TCPListen | Protocol::UDPListen => {}
+
+        true
     }
-    Ok(())
+}
+
+fn is_moving(lat: f64, long: f64, prev_lat: Option<f64>, prev_long: Option<f64>) -> bool {
+    if let Some(prev_lat) = prev_lat
+        && let Some(prev_long) = prev_long
+    {
+        let lat_diff = (lat - prev_lat).abs();
+        let long_diff = (long - prev_long).abs();
+
+        lat_diff > 0.001 || long_diff > 0.001
+    } else {
+        true
+    }
 }
 
 fn get_config_dir() -> PathBuf {
