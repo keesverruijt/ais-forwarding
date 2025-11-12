@@ -21,6 +21,13 @@ use common::send_message_udp;
 mod cache;
 mod location;
 
+#[derive(PartialEq)]
+enum RmcSource {
+    RMC,
+    AIS,
+    Both,
+}
+
 struct LastSent {
     vessel_dynamic_data: Instant,
     vessel_static_data: Instant,
@@ -114,6 +121,22 @@ fn main() {
             log::error!("Invalid MMSI in config.ini: {}", e);
             exit(1);
         }
+    };
+
+    let rmc_source = match general.get("rmc_source") {
+        None => {
+            log::error!("Missing rmc_source in config.ini");
+            exit(1);
+        }
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "rmc" => RmcSource::RMC,
+            "ais" => RmcSource::AIS,
+            "both" => RmcSource::Both,
+            _ => {
+                log::error!("Invalid rmc_source (should be AIS, RMC or Both) in config.ini");
+                exit(1);
+            }
+        },
     };
     let interval = match general.get("interval").map(|v| v.parse::<u64>()) {
         None => 60,
@@ -215,7 +238,7 @@ fn main() {
             location_interval,
             location_anchor_interval,
         );
-        if let Err(e) = dispatcher.work() {
+        if let Err(e) = dispatcher.work(&rmc_source) {
             log::error!("{}", e);
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -270,7 +293,7 @@ impl Dispatcher {
     // The location update will be sent to the location receiver thread.
     // The location update will be sent every `location_interval` seconds when the vessel is
     // moving or every `location_anchor_interval` seconds when the vessel is not moving.
-    fn work(&mut self) -> io::Result<()> {
+    fn work(&mut self, rmc_source: &RmcSource) -> io::Result<()> {
         const RMC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
         let mut fragments = Vec::new();
@@ -300,7 +323,8 @@ impl Dispatcher {
                         if let (Some(own_vessel), lat, long) = match &parsed_message {
                             ParsedMessage::VesselDynamicData(data) => (
                                 Some(
-                                    last_seen_rmc_message + RMC_MESSAGE_TIMEOUT > now
+                                    *rmc_source != RmcSource::RMC
+                                        && last_seen_rmc_message + RMC_MESSAGE_TIMEOUT > now
                                         && data.own_vessel,
                                 ),
                                 data.latitude,
@@ -308,8 +332,12 @@ impl Dispatcher {
                             ),
                             ParsedMessage::VesselStaticData(_data) => (Some(false), None, None),
                             ParsedMessage::Rmc(data) => {
-                                last_seen_rmc_message = now;
-                                (Some(true), data.latitude, data.longitude)
+                                if *rmc_source != RmcSource::AIS {
+                                    last_seen_rmc_message = now;
+                                    (Some(true), data.latitude, data.longitude)
+                                } else {
+                                    (None, None, None)
+                                }
                             }
                             _ => (None, None, None),
                         } {

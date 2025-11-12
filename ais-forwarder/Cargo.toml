@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-chrono = "0.4.41"
-config = { version = "0.15.11", features = ["ini"] }
+chrono = "0.4.42"
+config = { version = "0.15.18", features = ["ini"] }
 directories = "6.0.0"
 env_logger = "0.11.8"
-log = "0.4.27"
+log = "0.4.28"
 # nmea-parser = { git = "https://github.com/keesverruijt/nmea-parser", "branch" = "add_missing_lookups" }
 nmea-parser = { path = "../../nmea-parser" }
 common = { path = "../common" }
 sled = "0.34.7"
-time = "0.3.41"
+time = "0.3.44"
 udp-stream = "0.0.12"
-clap = { version = "4.5.38", features = ["derive"] }
-clap-verbosity-flag = "3.0.3"
+clap = { version = "4.5.51", features = ["derive"] }
+clap-verbosity-flag = "3.0.4"
 socket2 = "0.5.10"

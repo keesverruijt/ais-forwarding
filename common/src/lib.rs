@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 pub mod buffer;
@@ -253,5 +253,91 @@ impl NetworkEndpoint {
             io::ErrorKind::Other,
             "Failed to read message from network endpoint",
         ))
+    }
+
+    pub fn is_connected(&mut self) -> bool {
+        match self.protocol {
+            Protocol::TCP | Protocol::TCPListen => {
+                self.tcp_stream.retain(|writer| {
+                    if writer.peer_addr().is_err() {
+                        log::warn!("Removing disconnected TCP stream");
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.tcp_stream.len() > 0
+            }
+            Protocol::UDP => self.udp_socket.is_some(),
+            Protocol::UDPListen => true,
+        }
+    }
+
+    pub fn send_message(&mut self, nmea_message: &[u8], key: &String) -> io::Result<()> {
+        match self.protocol {
+            Protocol::TCP => {
+                self.tcp_stream.retain(|writer| {
+                    if writer.peer_addr().is_err() {
+                        log::warn!("Removing disconnected TCP stream");
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                if self.tcp_stream.len() == 0 {
+                    let stream = std::net::TcpStream::connect(self.addr).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("{} ({}): {}", key, self.addr, e),
+                        )
+                    })?;
+
+                    // Set the stream to use keepalive
+                    let sock_ref = socket2::SockRef::from(&stream);
+                    let mut ka = socket2::TcpKeepalive::new();
+                    ka = ka.with_time(Duration::from_secs(30));
+                    ka = ka.with_interval(Duration::from_secs(30));
+                    sock_ref.set_tcp_keepalive(&ka)?;
+
+                    log::info!("{}: Connected to {}", key, self);
+                    let writer = BufReaderDirectWriter::new(stream);
+                    self.tcp_stream.push(writer);
+                }
+                if let Some(tcp_stream) = self.tcp_stream.get_mut(0) {
+                    send_message_tcp(tcp_stream, nmea_message).map_err(|e| {
+                        self.tcp_stream.clear();
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("send_message tcp {} ({}): {}", key, self.addr, e),
+                        )
+                    })?;
+                    log::debug!("{}: Sent message to {}", key, self);
+                }
+            }
+            Protocol::UDP => {
+                if self.udp_socket.is_none() {
+                    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("{} ({}): {}", key, self.addr, e),
+                        )
+                    })?;
+                    UdpSocket::connect(&socket, self.addr)?;
+                    log::info!("{}: Connected to {}", key, self);
+                    self.udp_socket = Some(socket);
+                }
+                if let Some(udp_socket) = self.udp_socket.as_mut() {
+                    send_message_udp(udp_socket, nmea_message).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("send_message udp {} ({}): {}", key, self.addr, e),
+                        )
+                    })?;
+                }
+            }
+            Protocol::TCPListen | Protocol::UDPListen => {}
+        }
+        Ok(())
     }
 }

@@ -1,3 +1,4 @@
+use chrono::{DateTime, TimeDelta, Utc};
 /// (C) 2025 by Kees Verruijt, Harlingen, Netherlands
 use nmea_parser::ParsedMessage;
 use std::collections::HashMap;
@@ -5,8 +6,8 @@ use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use crate::NetworkEndpoint;
 use crate::cache::Persistence;
-use crate::{NetworkEndpoint, send_message};
 
 pub fn work_thread(
     rx: std::sync::mpsc::Receiver<ParsedMessage>,
@@ -27,7 +28,10 @@ struct Location {
     prev_longitude: Option<f64>,
     doubtful_latitude: Option<f64>,
     doubtful_longitude: Option<f64>,
+    resend_timeout: DateTime<Utc>,
 }
+
+const RESEND_TIMEOUT: Duration = Duration::from_secs(360);
 
 impl Location {
     fn new(
@@ -35,6 +39,8 @@ impl Location {
         persistence: Persistence,
         mmsi: u32,
     ) -> Self {
+        let now = chrono::Utc::now();
+
         Self {
             location,
             persistence,
@@ -43,6 +49,7 @@ impl Location {
             prev_longitude: None,
             doubtful_latitude: None,
             doubtful_longitude: None,
+            resend_timeout: now + RESEND_TIMEOUT,
         }
     }
 
@@ -53,33 +60,20 @@ impl Location {
             "Starting location loop with {} endpoints",
             self.location.len()
         );
-        // Keep track of whether we are able to send messages to the server
-        let mut connection_ok = self.resend_messages().is_ok();
-        let mut first = true;
+        self.resend_messages();
 
         loop {
             match rx.recv_timeout(MESSAGE_TIMEOUT) {
                 Ok(message) => {
+                    if self.resend_timeout < chrono::Utc::now() {
+                        self.resend_messages();
+                    }
                     log::debug!("Received message: {:?}", message);
-                    if !connection_ok {
-                        first = true;
-                        connection_ok = self.resend_messages().is_ok();
-                    }
-                    connection_ok = self.parse_message(&message, connection_ok).is_ok();
-                    if first {
-                        log::info!(
-                            "Location thread sent first message, connection ok: {}",
-                            connection_ok
-                        );
-                        first = false;
-                    }
+                    self.parse_message(&message);
                 }
                 Err(e) => match e {
                     std::sync::mpsc::RecvTimeoutError::Timeout => {
-                        connection_ok = self.resend_messages().is_ok();
-                        if !connection_ok {
-                            first = true;
-                        }
+                        self.resend_messages();
                         continue;
                     }
                     std::sync::mpsc::RecvTimeoutError::Disconnected => {
@@ -94,13 +88,16 @@ impl Location {
         }
     }
 
-    fn resend_messages(&mut self) -> io::Result<()> {
+    fn resend_messages(&mut self) {
         let resend_count = self.persistence.count();
         if resend_count == 0 {
             log::info!("No messages to resend from persistence");
-            return Ok(());
+            return;
         }
+        self.resend_timeout = chrono::Utc::now() + RESEND_TIMEOUT;
+
         log::info!("Resending {} messages from persistence", resend_count);
+        let mut failing_locations = HashMap::new();
         for item in self.persistence.iter() {
             match item {
                 Ok((key, value)) => {
@@ -108,19 +105,26 @@ impl Location {
                     let value = &value.to_vec();
                     let skey = String::from_utf8_lossy(&key);
                     let svalue = String::from_utf8_lossy(&value);
-                    log::debug!("Resending message: {}: {}", skey, svalue);
-                    for (key, address) in self.location.iter_mut() {
-                        send_message(value, key, address)?;
+
+                    let old_location = skey.split("@").next().unwrap();
+                    if !failing_locations.contains_key(old_location) {
+                        log::debug!("Resending message: {}: {}", skey, svalue);
+                        for (location, address) in self.location.iter_mut() {
+                            if address.send_message(value, &location).is_ok() {
+                                self.persistence.remove(key);
+                                self.persistence.flush();
+                                log::info!("Finally sent message {}", svalue);
+                            } else {
+                                failing_locations.insert(location.to_owned(), 0);
+                            }
+                        }
                     }
-                    self.persistence.remove(key);
-                    self.persistence.flush();
                 }
                 Err(e) => {
                     log::error!("Error reading from database: {}", e);
                 }
             }
         }
-        Ok(())
     }
 
     fn validate_position(&mut self, latitude: Option<f64>, longitude: Option<f64>) -> bool {
@@ -170,7 +174,7 @@ impl Location {
         true
     }
 
-    fn parse_message(&mut self, message: &ParsedMessage, connection_ok: bool) -> io::Result<()> {
+    fn parse_message(&mut self, message: &ParsedMessage) {
         let now = chrono::Utc::now();
         const TIME_FORMAT: &str = "%H%M%S";
         const DATE_FORMAT: &str = "%d%m%y";
@@ -182,7 +186,7 @@ impl Location {
                     // is the new ships position.
                     self.doubtful_latitude = message.latitude;
                     self.doubtful_longitude = message.longitude;
-                    return Ok(());
+                    return;
                 }
                 self.prev_latitude = message.latitude;
                 self.prev_longitude = message.longitude;
@@ -205,13 +209,22 @@ impl Location {
                     // is the new ships position.
                     self.doubtful_latitude = message.latitude;
                     self.doubtful_longitude = message.longitude;
-                    return Ok(());
+                    return;
                 }
                 self.prev_latitude = message.latitude;
                 self.prev_longitude = message.longitude;
                 self.doubtful_latitude = None;
                 self.doubtful_longitude = None;
-                let ts = message.timestamp.unwrap_or(now);
+                let ts = if let Some(ts) = message.timestamp {
+                    if (now - ts).abs() > TimeDelta::minutes(60) {
+                        log::error!("Message has weird timestamp: {:?}, using {}", message, now);
+                        now
+                    } else {
+                        ts
+                    }
+                } else {
+                    now
+                };
                 format!(
                     "{}$GNRMC,{},A,{},{},{},{},{},,,A\r\n",
                     self.mmsi,
@@ -225,27 +238,26 @@ impl Location {
             }
             _ => {
                 log::warn!("Unsupported message type: {:?}", message);
-                return Ok(());
+                return;
             }
         };
 
         let nmea_bytes = nmea_message.as_bytes();
-        for (key, address) in self.location.iter_mut() {
-            let db_key = format!("{}-{}", now, key);
-            if !connection_ok {
-                log::debug!("Storing message: {}: {}", key, nmea_message);
+        for (location, address) in self.location.iter_mut() {
+            let db_key = format!("{}@{}", location, now);
+            if !address.is_connected() {
+                log::debug!("Storing message: {}: {}", location, nmea_message);
                 self.persistence.store(db_key.as_bytes(), nmea_bytes);
                 self.persistence.flush();
             } else {
-                log::debug!("Sending message: {}: {}", key, nmea_message);
-                if let Err(e) = send_message(&nmea_bytes, key, address) {
-                    log::error!("Error sending location message to {}: {}", key, e);
+                log::debug!("Sending message: {}: {}", location, nmea_message);
+                if let Err(e) = address.send_message(&nmea_bytes, location) {
+                    log::error!("Error sending location message to {}: {}", location, e);
                     self.persistence.store(db_key.as_bytes(), nmea_bytes);
                     self.persistence.flush();
                 }
             }
         }
-        Ok(())
     }
 
     fn format_option(value: Option<f64>) -> String {

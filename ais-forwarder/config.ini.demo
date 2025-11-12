@@ -6,6 +6,13 @@
 mmsi = 000000000
 
 #
+# How are incoming RMC and AIS own-ship messages to be sent out as RMC
+# message?
+# Either "RMC", "AIS" or "Both" (default "Both")
+#
+rmc_source = "Both"
+
+#
 # Time in seconds between updates for each vessel
 # The longer the less traffic is generated
 #
