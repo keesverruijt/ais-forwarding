@@ -67,11 +67,12 @@ fn process_message(message: &str, db_path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let (id, message) = message.split_at(i);
-    let i = id.find('@').unwrap_or(0);
+    let i = id.find('@').map(|i| i + 1).unwrap_or(0);
     let (_key, id) = id.split_at(i);
 
     let nmea_id = &message[3..6].to_lowercase();
-    let new_line = format!("{}\r\n", message);
+    let message = message.trim_end();
+    let new_line = format!("{}\n", message);
     let now: OffsetDateTime = SystemTime::now().into();
     let year = now.year();
 
