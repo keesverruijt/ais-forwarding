@@ -475,18 +475,18 @@
 
       if (singleYear) {
         if (!map.hasLayer(layers.speed)) layers.speed.addTo(map);
-        if (map.getZoom() >= WIND_ZOOM) {
-          if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
-        } else {
-          if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
-        }
         layers.basic.setStyle({ opacity: 0.2 });
         swatch.style.background = `linear-gradient(to right, ${speedColor(2)} 0%, ${speedColor(2)} 45%, ${speedColor(6)} 45%, ${speedColor(6)} 63%, ${speedColor(8)} 63%, ${speedColor(8)} 82%, ${speedColor(10)} 82%)`;
       } else {
         if (map.hasLayer(layers.speed)) map.removeLayer(layers.speed);
-        if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
         layers.basic.setStyle({ opacity: 0.8 });
         swatch.style.background = row.dataset.color;
+      }
+
+      if (map.getZoom() >= WIND_ZOOM) {
+        if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
+      } else {
+        if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
       }
     }
 
