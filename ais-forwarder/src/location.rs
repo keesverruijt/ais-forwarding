@@ -206,9 +206,14 @@ impl Location {
         };
 
         if let Some(wind) = &location_message.true_wind {
-            nmea_message += &format!(
-                "$IIMWV,{:.1},T,{:.1},N,A\r\n",
-                wind.direction_degrees, wind.speed_knots
+            // Append wind data as extra fields on the RMC line (after the
+            // standard mode indicator) so it stays on a single line for the
+            // location-receiver which reads line by line.
+            // Format: ...,A,<twd>,<tws>\r\n
+            let rn = nmea_message.rfind("\r\n").unwrap_or(nmea_message.len());
+            nmea_message.insert_str(
+                rn,
+                &format!(",{:.1},{:.1}", wind.direction_degrees, wind.speed_knots),
             );
         }
 

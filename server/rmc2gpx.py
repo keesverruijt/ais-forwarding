@@ -41,7 +41,15 @@ def parse_rmc(line):
     sog = _parse_float(fields[7])
     cog = _parse_float(fields[8])
 
-    return {"time": dt, "lat": lat, "lon": lon, "sog": sog, "cog": cog}
+    result = {"time": dt, "lat": lat, "lon": lon, "sog": sog, "cog": cog}
+
+    # Extra fields after standard RMC: twd, tws (appended by ais-forwarder)
+    if len(fields) > 13 and fields[13]:
+        result["twd"] = _parse_float(fields[13])
+    if len(fields) > 14 and fields[14]:
+        result["tws"] = _parse_float(fields[14])
+
+    return result
 
 
 def parse_mwv(line):

@@ -20,19 +20,19 @@ mpi: build
 	scp $(BINARY) $(PI):$(PI_BIN)
 	ssh $(PI) systemctl start $(SERVICE)
 
-run: mpi
+mpi-run: mpi
 	@# Run with debug logging, output to terminal
 	ssh $(PI) systemctl stop $(SERVICE) || :
 	(ssh $(PI) ais-forwarder -v 2>&1) | tee /tmp/ais.log
 
-debug: build
+mpi-debug: build
 	@# Build + run with debug logging without install
 	ssh $(PI) systemctl stop $(SERVICE) || :
 	ssh $(PI) killall -9 ais-forwarder || :
 	scp $(BINARY) $(PI):$(PI_BIN)
 	(ssh $(PI) ais-forwarder -v 2>&1) | tee /tmp/ais.log
 
-trace: build
+mpi-trace: build
 	@# Build + run with trace logging
 	ssh $(PI) systemctl stop $(SERVICE) || :
 	ssh $(PI) killall -9 ais-forwarder || :

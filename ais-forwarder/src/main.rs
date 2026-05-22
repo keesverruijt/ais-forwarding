@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{io, path};
 
 use common::NetworkEndpoint;
-use common::nmea::{Message18, Message24, TrueWind, parse_mwv_true};
+use common::nmea::{Message18, Message24, TrueWind, calculate_checksum, parse_mwv_true};
 
 pub struct LocationMessage {
     pub parsed: ParsedMessage,
@@ -63,6 +63,8 @@ struct Dispatcher {
     latest_true_wind: Option<TrueWind>,
     wind_source: Option<String>,
     own_ship_static: Option<OwnShipStaticInfo>,
+    ais_msg_count: HashMap<String, u64>,
+    next_ais_stats_ts: SystemTime,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -356,6 +358,8 @@ impl Dispatcher {
             latest_true_wind: None,
             wind_source,
             own_ship_static,
+            ais_msg_count: HashMap::new(),
+            next_ais_stats_ts: SystemTime::now() + Duration::from_secs(3600),
         }
     }
 
@@ -413,14 +417,14 @@ impl Dispatcher {
                 next_dump_ts = now.add(Duration::from_secs(60));
                 let now = Instant::now();
                 let goalpost = now - Duration::from_secs(120);
-                log::info!(
+                log::debug!(
                     "Dumping AIS messages to the cache; sent {} messages",
                     ais_counter
                 );
                 ais_counter = 0;
                 for (mmsi, ts) in self.last_sent.iter() {
                     if ts.vessel_dynamic_data >= goalpost || ts.vessel_static_data >= goalpost {
-                        log::info!(
+                        log::debug!(
                             "MMSI {}: static {}s, dynamic {}s",
                             mmsi,
                             (now - ts.vessel_static_data).as_secs(),
@@ -428,6 +432,10 @@ impl Dispatcher {
                         );
                     }
                 }
+            }
+
+            if now >= self.next_ais_stats_ts {
+                self.log_ais_stats();
             }
 
             // Send own ship static data every 5 minutes if no AIS transponder
@@ -570,10 +578,52 @@ impl Dispatcher {
     }
 
     fn broadcast_ais_bytes(&mut self, nmea_message: &[u8]) -> io::Result<()> {
+        let msg = Self::rewrite_aivdo(nmea_message);
+        let msg = msg.as_ref().map_or(nmea_message, |v| v.as_slice());
         for (key, address) in self.ais.iter_mut() {
-            address.send_message(nmea_message, key)?;
+            address.send_message(msg, key)?;
+            *self.ais_msg_count.entry(key.clone()).or_insert(0) += 1;
         }
         Ok(())
+    }
+
+    fn log_ais_stats(&mut self) {
+        for (dest, count) in self.ais_msg_count.drain() {
+            log::info!("AIS stats: {} messages sent to {}", count, dest);
+        }
+        self.next_ais_stats_ts = SystemTime::now() + Duration::from_secs(3600);
+    }
+
+    /// Rewrite !AIVDO sentences to !AIVDM, recalculating checksums.
+    /// Returns None if no rewrite was needed.
+    fn rewrite_aivdo(nmea_message: &[u8]) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(nmea_message).ok()?;
+        if !text.contains("AIVDO") {
+            return None;
+        }
+        let mut result = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            if line.starts_with("!AIVDO") {
+                let rewritten = line.replacen("AIVDO", "AIVDM", 1);
+                // Recalculate checksum
+                if let Some(star) = rewritten.rfind('*') {
+                    let content = &rewritten[1..star];
+                    let checksum = calculate_checksum(content);
+                    result += &rewritten[..=star];
+                    result += &format!("{:02X}", checksum);
+                    // Preserve trailing \r\n
+                    let after_cs = &rewritten[star + 1..];
+                    if let Some(nl) = after_cs.find('\r').or_else(|| after_cs.find('\n')) {
+                        result += &after_cs[nl..];
+                    }
+                } else {
+                    result += &rewritten;
+                }
+            } else {
+                result += line;
+            }
+        }
+        Some(result.into_bytes())
     }
 
     fn check_last_sent(&mut self, message: &ParsedMessage) -> bool {

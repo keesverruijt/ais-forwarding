@@ -21,13 +21,6 @@
   #map-wrap.fullscreen #map {
     height: 100vh;
   }
-  #header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 4px 0;
-  }
-
   /* Legend inside map */
   .map-legend {
     background: rgba(255, 255, 255, 0.92);
@@ -103,14 +96,53 @@
   #speed-scale .labels > span {
     text-align: center;
   }
-
-  /* Fullscreen button */
-  .fullscreen-btn {
-    background: white;
-    border: 2px solid rgba(0, 0, 0, 0.2);
+  /* Nautical scale bar */
+  .nm-scale {
+    background: rgba(255, 255, 255, 0.88);
+    -webkit-backdrop-filter: blur(3px);
+    backdrop-filter: blur(3px);
+    padding: 3px 7px 5px;
     border-radius: 4px;
-    width: 30px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+    font: 10px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      sans-serif;
+    color: #333;
+    min-width: 50px;
+    text-align: center;
+  }
+  .nm-bar {
+    border: 2px solid #333;
+    border-top: none;
+    height: 4px;
+    margin-bottom: 2px;
+  }
+
+  /* Top bar control (title + buttons) */
+  .map-topbar {
+    background: rgba(255, 255, 255, 0.92);
+    -webkit-backdrop-filter: blur(4px);
+    backdrop-filter: blur(4px);
+    border-radius: 6px;
+    box-shadow: 0 1px 5px rgba(0, 0, 0, 0.25);
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 2px 0 8px;
     height: 30px;
+  }
+  .map-title {
+    font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      sans-serif;
+    color: #333;
+    white-space: nowrap;
+    padding-right: 4px;
+  }
+  .map-btn {
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    width: 26px;
+    height: 26px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -118,31 +150,26 @@
     font-size: 16px;
     line-height: 1;
     color: #333;
-    box-shadow: none;
+    padding: 0;
   }
-  .fullscreen-btn:hover {
-    background: #f4f4f4;
+  .map-btn:hover {
+    background: rgba(0, 0, 0, 0.08);
   }
 
-  .wind-arrow {
-    font-size: 14px;
-    color: #0077cc;
-    text-shadow: 0 0 2px white, 0 0 2px white;
+  .wind-barb {
+    line-height: 0;
   }
 </style>
-<div id="header">
-  <div><?php echo $name . " mmsi " . $mmsi;?></div>
-  <button type="button" onClick="window.location.reload();">Refresh</button>
-</div>
 <div id="map-wrap">
   <div id="map"></div>
 </div>
 <script type="module">
   const mmsi = "<?php echo $mmsi;?>";
+  const shipName = "<?php echo addslashes($name); ?>";
   const map = L.map("map");
-  L.tileLayer("http://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution:
-      'Map data &copy; <a href="http://www.osm.org">OpenStreetMap</a>',
+      'Map data &copy; <a href="https://www.osm.org">OpenStreetMap</a>',
   }).addTo(map);
 
   const base_url = "https://merrimac.nl/wp-content/uploads/map/";
@@ -152,19 +179,30 @@
     .then((data) => processFiles(data))
     .catch((error) => console.error("Error fetching JSON:", error));
 
-  // --- Fullscreen control (uses native Fullscreen API) ---
-  const fullscreenCtrl = L.control({ position: "topright" });
-  fullscreenCtrl.onAdd = function () {
-    const btn = L.DomUtil.create("button", "fullscreen-btn");
-    btn.type = "button";
-    btn.title = "Toggle fullscreen";
-    btn.innerHTML = "\u26f6";
-    L.DomEvent.disableClickPropagation(btn);
-    btn.addEventListener("click", () => {
+  // --- Top bar control: title / refresh / fullscreen ---
+  const topbarCtrl = L.control({ position: "topright" });
+  topbarCtrl.onAdd = function () {
+    const bar = L.DomUtil.create("div", "map-topbar");
+    L.DomEvent.disableClickPropagation(bar);
+    L.DomEvent.disableScrollPropagation(bar);
+
+    const title = L.DomUtil.create("span", "map-title", bar);
+    title.textContent = shipName + " / " + mmsi;
+
+    const refreshBtn = L.DomUtil.create("button", "map-btn", bar);
+    refreshBtn.type = "button";
+    refreshBtn.title = "Refresh";
+    refreshBtn.innerHTML = "\u21bb"; // ↻
+    refreshBtn.addEventListener("click", () => window.location.reload());
+
+    const fsBtn = L.DomUtil.create("button", "map-btn", bar);
+    fsBtn.type = "button";
+    fsBtn.title = "Toggle fullscreen";
+    fsBtn.innerHTML = "\u26f6"; // ⛶
+    fsBtn.addEventListener("click", () => {
       const wrap = document.getElementById("map-wrap");
       if (!document.fullscreenElement) {
         wrap.requestFullscreen().catch(() => {
-          // Fallback for browsers without Fullscreen API
           wrap.classList.add("fullscreen");
           map.invalidateSize();
         });
@@ -175,14 +213,14 @@
 
     document.addEventListener("fullscreenchange", () => {
       const isFS = !!document.fullscreenElement;
-      btn.innerHTML = isFS ? "\u2715" : "\u26f6";
-      btn.title = isFS ? "Exit fullscreen" : "Toggle fullscreen";
+      fsBtn.innerHTML = isFS ? "\u2715" : "\u26f6";
+      fsBtn.title = isFS ? "Exit fullscreen" : "Toggle fullscreen";
       map.invalidateSize();
     });
 
-    return btn;
+    return bar;
   };
-  fullscreenCtrl.addTo(map);
+  topbarCtrl.addTo(map);
 
   // --- Legend control ---
   const legendCtrl = L.control({ position: "bottomleft" });
@@ -196,6 +234,100 @@
   legendCtrl.addTo(map);
 
   const yearLayers = {};
+  const WIND_ZOOM = 7;
+
+  // --- Geo graticule (canvas overlay, no Leaflet layers) ---
+  (function addGraticule() {
+    const cvs = document.createElement("canvas");
+    cvs.style.cssText =
+      "position:absolute;top:0;left:0;pointer-events:none;z-index:400";
+    map.getContainer().appendChild(cvs);
+
+    function spacing(zoom) {
+      if (zoom < 5) return 10;
+      if (zoom < 7) return 5;
+      if (zoom < 9) return 1;
+      if (zoom < 11) return 0.5;
+      if (zoom < 13) return 0.25;
+      return 0.1;
+    }
+
+    let raf = null;
+    function schedDraw() {
+      if (!raf) raf = requestAnimationFrame(() => { raf = null; draw(); });
+    }
+
+    function draw() {
+      if (map.getZoom() == null) return;
+      const size = map.getSize();
+      cvs.width = size.x;
+      cvs.height = size.y;
+      const ctx = cvs.getContext("2d");
+      ctx.strokeStyle = "rgba(100,100,100,0.35)";
+      ctx.lineWidth = 0.7;
+
+      const b = map.getBounds().pad(0.05);
+      const s = spacing(map.getZoom());
+      const minLat = Math.floor(b.getSouth() / s) * s;
+      const maxLat = Math.ceil(b.getNorth() / s) * s;
+      const minLon = Math.floor(b.getWest() / s) * s;
+      const maxLon = Math.ceil(b.getEast() / s) * s;
+
+      ctx.beginPath();
+      for (let lat = minLat; lat <= maxLat + s * 0.01; lat = +((lat + s).toFixed(8))) {
+        const y = Math.round(lat / s) * s;
+        const a = map.latLngToContainerPoint([y, minLon]);
+        const b2 = map.latLngToContainerPoint([y, maxLon]);
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b2.x, b2.y);
+      }
+      for (let lon = minLon; lon <= maxLon + s * 0.01; lon = +((lon + s).toFixed(8))) {
+        const x = Math.round(lon / s) * s;
+        const a = map.latLngToContainerPoint([minLat, x]);
+        const b2 = map.latLngToContainerPoint([maxLat, x]);
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b2.x, b2.y);
+      }
+      ctx.stroke();
+    }
+
+    map.on("move zoom moveend zoomend resize", schedDraw);
+  })();
+
+  // --- Nautical scale bar ---
+  (function addScaleBar() {
+    const ctrl = L.control({ position: "bottomright" });
+    ctrl.onAdd = function () {
+      const div = L.DomUtil.create("div", "nm-scale");
+      L.DomEvent.disableClickPropagation(div);
+      function update() {
+        const zoom = map.getZoom();
+        if (zoom == null) return;
+        const center = map.getCenter();
+        const metersPerPx =
+          (40075017 * Math.cos((center.lat * Math.PI) / 180)) /
+          Math.pow(2, zoom + 8);
+        const nmPerPx = metersPerPx / 1852;
+        const targetNm = nmPerPx * 90; // aim for ~90px bar
+        // Round to a "nice" nm value
+        const magnitude = Math.pow(10, Math.floor(Math.log10(targetNm)));
+        const frac = targetNm / magnitude;
+        const nice =
+          magnitude *
+          (frac < 1.5 ? 1 : frac < 3.5 ? 2 : frac < 7.5 ? 5 : 10);
+        const barPx = Math.round(nice / nmPerPx);
+        div.innerHTML =
+          `<div class="nm-bar" style="width:${barPx}px"></div>` +
+          `${nice < 1 ? nice.toFixed(1) : nice} nm`;
+      }
+      map.on("zoomend moveend", update);
+      map.whenReady(update);
+      return div;
+    };
+    ctrl.addTo(map);
+  })();
+
+  map.on("zoomend moveend", updateDetailLayers);
 
   function speedColor(knots) {
     if (knots == null) return "#888";
@@ -326,6 +458,9 @@
             dist.toFixed(0) + " nm, max " + maxSpd.toFixed(1) + " kn";
         }
 
+        // updateDetailLayers is also triggered by the zoomend/moveend that
+        // fires when fitBounds animation completes, so wind barbs appear at
+        // the correct post-animation zoom level.
         updateDetailLayers();
       });
   }
@@ -340,7 +475,11 @@
 
       if (singleYear) {
         if (!map.hasLayer(layers.speed)) layers.speed.addTo(map);
-        if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
+        if (map.getZoom() >= WIND_ZOOM) {
+          if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
+        } else {
+          if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
+        }
         layers.basic.setStyle({ opacity: 0.2 });
         swatch.style.background = `linear-gradient(to right, ${speedColor(2)} 0%, ${speedColor(2)} 45%, ${speedColor(6)} 45%, ${speedColor(6)} 63%, ${speedColor(8)} 63%, ${speedColor(8)} 82%, ${speedColor(10)} 82%)`;
       } else {
@@ -421,21 +560,64 @@
     return group;
   }
 
+  // Build an SVG wind barb (20x30px).
+  // Staff ends at bottom-center (the boat position). Feathers extend to the right.
+  // Full feather = 10 kn, half = 5 kn, pennant = 50 kn.
+  // The SVG is rotated so the staff points in the direction wind comes FROM,
+  // with feathers arriving from top-right toward the boat.
+  function windBarbSVG(knots, rotation) {
+    const W = 20, H = 30;
+    const cx = W / 2;
+    const staffTop = 3, staffBot = H;
+    const barbLen = 7, halfLen = 4;
+    const barbGap = 3;
+
+    let paths = [];
+    paths.push(`M${cx},${staffTop} L${cx},${staffBot}`);
+
+    let remaining = Math.round(knots / 5) * 5;
+    let y = staffTop;
+
+    while (remaining >= 50) {
+      paths.push(
+        `M${cx},${y} L${cx + barbLen},${y + barbGap / 2} L${cx},${y + barbGap} Z`
+      );
+      y += barbGap + 1;
+      remaining -= 50;
+    }
+    while (remaining >= 10) {
+      paths.push(`M${cx},${y} L${cx + barbLen},${y - 2}`);
+      y += barbGap;
+      remaining -= 10;
+    }
+    if (remaining >= 5) {
+      paths.push(`M${cx},${y} L${cx + halfLen},${y - 1}`);
+    }
+
+    return (
+      `<svg xmlns="https://www.w3.org/2000/svg" width="${W}" height="${H}" ` +
+      `style="transform:rotate(${rotation}deg);transform-origin:center bottom">` +
+      `<path d="${paths.join(" ")}" stroke="#0055aa" stroke-width="1.5" ` +
+      `fill="#0055aa" stroke-linecap="round"/></svg>`
+    );
+  }
+
   function createWindLayer(trackData) {
     const group = L.layerGroup();
     const step = Math.max(1, Math.floor(trackData.length / 200));
+    const W = 20, H = 30;
     for (let i = 0; i < trackData.length; i += step) {
       const p = trackData[i];
       if (p.twd == null || p.tws == null) continue;
 
-      const rotation = p.twd;
-      const size = Math.min(8 + p.tws * 0.5, 20);
+      // TWD is relative to boat heading; add COG for true north on the map
+      const rotation = ((p.twd || 0) + (p.cog || 0)) % 360;
 
       const icon = L.divIcon({
-        className: "wind-arrow",
-        html: `<span style="display:inline-block;transform:rotate(${rotation}deg);font-size:${size}px">\u2193</span>`,
-        iconSize: [size, size],
-        iconAnchor: [size / 2, size / 2],
+        className: "wind-barb",
+        html: windBarbSVG(p.tws, rotation),
+        iconSize: [W, H],
+        iconAnchor: [W / 2, H], // bottom center = boat position
       });
 
       group.addLayer(

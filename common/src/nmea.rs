@@ -131,7 +131,7 @@ impl Message18 {
             .unwrap()
             .as_secs()
             % 60;
-        log::info!("Timestamp for AIS message: {}", timestamp);
+        log::debug!("Timestamp for AIS message: {}", timestamp);
         binary_str += &format!("{:06b}", timestamp);
 
         binary_str += "00"; // Spare bit
@@ -269,7 +269,7 @@ fn to_6bit_ascii(binary_str: &str) -> String {
     ascii_str
 }
 
-fn calculate_checksum(input: &str) -> u8 {
+pub fn calculate_checksum(input: &str) -> u8 {
     let mut checksum = 0u8;
     for c in input.chars() {
         checksum ^= c as u8;
