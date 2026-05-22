@@ -12,6 +12,12 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{io, path};
 
 use common::NetworkEndpoint;
+use common::nmea::{Message18, TrueWind, parse_mwv_true};
+
+pub struct LocationMessage {
+    pub parsed: ParsedMessage,
+    pub true_wind: Option<TrueWind>,
+}
 
 mod cache;
 mod location;
@@ -29,9 +35,10 @@ struct LastSent {
 }
 
 struct Dispatcher {
+    own_ship_mmsi: u32,
     provider: NetworkEndpoint,
     ais: HashMap<String, NetworkEndpoint>,
-    location_tx: Sender<ParsedMessage>,
+    location_tx: Sender<LocationMessage>,
     interval: u64,
     location_interval: u64,
     location_anchor_interval: u64,
@@ -42,6 +49,7 @@ struct Dispatcher {
     prev_longitude: Option<f64>,
     doubtful_latitude: Option<f64>,
     doubtful_longitude: Option<f64>,
+    latest_true_wind: Option<TrueWind>,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -121,6 +129,7 @@ fn main() {
             exit(1);
         }
     };
+    let own_ship_info = mmsi;
 
     let rmc_source = match general.get("rmc_source") {
         None => {
@@ -176,7 +185,7 @@ fn main() {
         }
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<ParsedMessage>();
+    let (tx, rx) = std::sync::mpsc::channel::<LocationMessage>();
     let location = match settings.get("location") {
         Some(location) => location,
         None => {
@@ -247,6 +256,7 @@ fn main() {
             .collect();
 
         let mut dispatcher = Dispatcher::new(
+            own_ship_info,
             provider,
             ais,
             tx.clone(),
@@ -263,14 +273,16 @@ fn main() {
 
 impl Dispatcher {
     fn new(
+        own_ship_mmsi: u32,
         provider: NetworkEndpoint,
         ais: HashMap<String, NetworkEndpoint>,
-        location_tx: Sender<ParsedMessage>,
+        location_tx: Sender<LocationMessage>,
         interval: u64,
         location_interval: u64,
         location_anchor_interval: u64,
     ) -> Self {
         Dispatcher {
+            own_ship_mmsi,
             provider,
             ais,
             location_tx,
@@ -284,6 +296,7 @@ impl Dispatcher {
             prev_longitude: None,
             doubtful_latitude: None,
             doubtful_longitude: None,
+            latest_true_wind: None,
         }
     }
 
@@ -315,35 +328,77 @@ impl Dispatcher {
     // moving or every `location_anchor_interval` seconds when the vessel is not moving.
     fn work(&mut self, rmc_source: &RmcSource) -> io::Result<()> {
         const RMC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+        const OWN_SHIP_AIS_TIMEOUT: Duration = Duration::from_secs(60);
 
         let mut fragments = Vec::new();
         let mut last_seen_rmc_message = SystemTime::UNIX_EPOCH;
         let now = SystemTime::now();
+        let mut last_own_ship_ais_sent = now;
         let mut next_location_ts = self.next_location_system_time(&now);
         let mut next_location_anchor_ts = self.next_location_anchor_system_time(&now);
+        let mut next_dump_ts = now.add(Duration::from_secs(0));
+        let mut ais_counter: u64 = 0;
+
+        log::info!(
+            "Starting dispatcher, provider {} with {} AIS endpoints",
+            self.provider,
+            self.ais.len(),
+        );
 
         loop {
+            let now = SystemTime::now();
+
+            if now >= next_dump_ts {
+                next_dump_ts = now.add(Duration::from_secs(60));
+                let now = Instant::now();
+                let goalpost = now - Duration::from_secs(120);
+                log::info!(
+                    "Dumping AIS messages to the cache; sent {} messages",
+                    ais_counter
+                );
+                ais_counter = 0;
+                for (mmsi, ts) in self.last_sent.iter() {
+                    if ts.vessel_dynamic_data >= goalpost || ts.vessel_static_data >= goalpost {
+                        log::info!(
+                            "MMSI {}: static {}s, dynamic {}s",
+                            mmsi,
+                            (now - ts.vessel_static_data).as_secs(),
+                            (now - ts.vessel_dynamic_data).as_secs()
+                        );
+                    }
+                }
+            }
+
             let message = self.provider.read_to_string()?;
 
             for line in message.lines() {
+                if let Some(wind) = parse_mwv_true(line) {
+                    self.latest_true_wind = Some(wind);
+                    continue;
+                }
+
                 match self.nmea_parser.parse_sentence(line) {
                     Ok(parsed_message) => {
                         if parsed_message == ParsedMessage::Incomplete {
                             fragments.push(line.to_string());
                             continue;
                         }
-                        let now = SystemTime::now();
 
                         if let (Some(own_vessel), lat, long) = match &parsed_message {
-                            ParsedMessage::VesselDynamicData(data) => (
-                                Some(
-                                    *rmc_source != RmcSource::RMC
-                                        && last_seen_rmc_message + RMC_MESSAGE_TIMEOUT > now
-                                        && data.own_vessel,
-                                ),
-                                data.latitude,
-                                data.longitude,
-                            ),
+                            ParsedMessage::VesselDynamicData(data) => {
+                                if data.own_vessel || data.mmsi == self.own_ship_mmsi {
+                                    last_own_ship_ais_sent = now;
+                                }
+                                (
+                                    Some(
+                                        *rmc_source != RmcSource::RMC
+                                            && last_seen_rmc_message + RMC_MESSAGE_TIMEOUT < now
+                                            && (data.own_vessel || data.mmsi == self.own_ship_mmsi),
+                                    ),
+                                    data.latitude,
+                                    data.longitude,
+                                )
+                            }
                             ParsedMessage::VesselStaticData(_data) => (Some(false), None, None),
                             ParsedMessage::Rmc(data) => {
                                 if *rmc_source != RmcSource::AIS {
@@ -355,13 +410,32 @@ impl Dispatcher {
                             }
                             _ => (None, None, None),
                         } {
-                            fragments.push(line.to_string());
+                            fragments.push(line.to_string()); // Add the last fragment to the make the message complete
 
                             if self.check_last_sent(&parsed_message) {
+                                ais_counter += 1;
                                 self.broadcast_ais(&parsed_message, fragments.join("").as_bytes())?;
                             }
 
                             if own_vessel && self.validate_position(lat, long) {
+                                if last_own_ship_ais_sent + OWN_SHIP_AIS_TIMEOUT < now
+                                    && let ParsedMessage::Rmc(data) = &parsed_message
+                                {
+                                    last_own_ship_ais_sent = now;
+                                    ais_counter += 1;
+                                    let dynamic_update_message = Message18::new(
+                                        true,
+                                        self.own_ship_mmsi,
+                                        data.sog_knots,
+                                        long,
+                                        lat,
+                                        data.bearing,
+                                        None,
+                                    );
+                                    let nmea_message = dynamic_update_message.to_nmea();
+                                    self.broadcast_ais(&parsed_message, nmea_message.as_bytes())?;
+                                }
+
                                 log::trace!(
                                     "Compare last sent location: {:?} interval {:?} anchor {:?}",
                                     now,
@@ -380,8 +454,13 @@ impl Dispatcher {
                                     self.prev_latitude = lat;
                                     self.prev_longitude = long;
                                     self.last_sent_location = now;
-                                    log::debug!("Sending location: {:?}", parsed_message);
-                                    self.location_tx.send(parsed_message).unwrap();
+                                    log::debug!("Forwarding location: {:?}", parsed_message);
+                                    self.location_tx
+                                        .send(LocationMessage {
+                                            parsed: parsed_message,
+                                            true_wind: self.latest_true_wind.clone(),
+                                        })
+                                        .unwrap();
                                     next_location_ts = self.next_location_system_time(&now);
                                     next_location_anchor_ts =
                                         self.next_location_anchor_system_time(&now);
@@ -420,7 +499,7 @@ impl Dispatcher {
                 if elapsed_secs >= self.interval {
                     last_sent.vessel_dynamic_data = now;
                     log::trace!(
-                        "Sending dynamic data for MMSI {} as we last sent it {} seconds ago",
+                        "Forwarding dynamic data for MMSI {} as we last sent it {} seconds ago",
                         data.mmsi,
                         elapsed_secs
                     );
@@ -443,7 +522,7 @@ impl Dispatcher {
                 if elapsed_secs >= self.interval {
                     last_sent.vessel_static_data = now;
                     log::trace!(
-                        "Sending static data for MMSI {} as we last sent it {} seconds ago",
+                        "Forwarding static data for MMSI {} as we last sent it {} seconds ago",
                         data.mmsi,
                         elapsed_secs
                     );

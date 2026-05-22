@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Convert NMEA RMC (+MWV wind) file to GPX with speed and wind extensions.
+
+Replaces gpsbabel for the ais-forwarder pipeline.
+
+Usage: rmc2gpx.py input.rmc output.gpx
+"""
+
+import sys
+import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+NS = "http://www.topografix.com/GPX/1/1"
+NS_EXT = "http://merrimac.nl/gpx/ext/1"
+
+
+def parse_rmc(line):
+    """Parse $xxRMC sentence, return dict or None."""
+    m = re.match(r"^\$..RMC,", line)
+    if not m:
+        return None
+    fields = line.split("*")[0].split(",")
+    if len(fields) < 10 or fields[2] != "A":
+        return None
+
+    time_str = fields[1]
+    date_str = fields[9]
+    try:
+        dt = datetime.strptime(date_str + time_str[:6], "%d%m%y%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+    lat = _parse_latlon(fields[3], fields[4])
+    lon = _parse_latlon(fields[5], fields[6])
+    if lat is None or lon is None:
+        return None
+
+    sog = _parse_float(fields[7])
+    cog = _parse_float(fields[8])
+
+    return {"time": dt, "lat": lat, "lon": lon, "sog": sog, "cog": cog}
+
+
+def parse_mwv(line):
+    """Parse $xxMWV true wind sentence, return dict or None."""
+    m = re.match(r"^\$..MWV,", line)
+    if not m:
+        return None
+    fields = line.split("*")[0].split(",")
+    if len(fields) < 6 or fields[2] != "T" or fields[5] != "A":
+        return None
+    angle = _parse_float(fields[1])
+    speed = _parse_float(fields[3])
+    if angle is None or speed is None:
+        return None
+    units = fields[4]
+    if units == "K":
+        speed /= 1.852
+    elif units == "M":
+        speed *= 1.94384
+    elif units != "N":
+        return None
+    return {"twd": angle, "tws": speed}
+
+
+def _parse_latlon(value, hemisphere):
+    if not value or not hemisphere:
+        return None
+    try:
+        # Format: DDDMM.MMMMM
+        dot = value.index(".")
+        degrees = float(value[: dot - 2])
+        minutes = float(value[dot - 2 :])
+        result = degrees + minutes / 60.0
+        if hemisphere in ("S", "W"):
+            result = -result
+        return result
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_float(s):
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def convert(input_path, output_path):
+    ET.register_namespace("", NS)
+    ET.register_namespace("ext", NS_EXT)
+
+    trackpoints = []
+
+    with open(input_path) as f:
+        pending_rmc = None
+        for raw_line in f:
+            line = raw_line.strip()
+            # Strip the persistence key prefix (e.g. "00000001@244123456")
+            if "@" in line and "$" in line:
+                line = line[line.index("$") :]
+
+            rmc = parse_rmc(line)
+            if rmc:
+                if pending_rmc:
+                    trackpoints.append(pending_rmc)
+                pending_rmc = rmc
+                continue
+
+            mwv = parse_mwv(line)
+            if mwv and pending_rmc:
+                pending_rmc.update(mwv)
+                continue
+
+        if pending_rmc:
+            trackpoints.append(pending_rmc)
+
+    trackpoints.sort(key=lambda tp: tp["time"])
+
+    # Build GPX
+    gpx = ET.Element(
+        "gpx",
+        version="1.1",
+        creator="rmc2gpx",
+        xmlns=NS,
+    )
+    metadata = ET.SubElement(gpx, "metadata")
+    ET.SubElement(metadata, "time").text = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    if trackpoints:
+        lats = [tp["lat"] for tp in trackpoints]
+        lons = [tp["lon"] for tp in trackpoints]
+        ET.SubElement(
+            metadata,
+            "bounds",
+            minlat=f"{min(lats):.9f}",
+            minlon=f"{min(lons):.9f}",
+            maxlat=f"{max(lats):.9f}",
+            maxlon=f"{max(lons):.9f}",
+        )
+
+    trk = ET.SubElement(gpx, "trk")
+    trkseg = ET.SubElement(trk, "trkseg")
+
+    for tp in trackpoints:
+        trkpt = ET.SubElement(
+            trkseg,
+            "trkpt",
+            lat=f"{tp['lat']:.9f}",
+            lon=f"{tp['lon']:.9f}",
+        )
+        ET.SubElement(trkpt, "time").text = tp["time"].strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        has_ext = (
+            tp.get("sog") is not None
+            or tp.get("cog") is not None
+            or tp.get("tws") is not None
+        )
+        if has_ext:
+            extensions = ET.SubElement(trkpt, "extensions")
+            if tp.get("sog") is not None:
+                ET.SubElement(extensions, f"{{{NS_EXT}}}sog").text = f"{tp['sog']:.1f}"
+            if tp.get("cog") is not None:
+                ET.SubElement(extensions, f"{{{NS_EXT}}}cog").text = f"{tp['cog']:.1f}"
+            if tp.get("tws") is not None:
+                ET.SubElement(extensions, f"{{{NS_EXT}}}tws").text = f"{tp['tws']:.1f}"
+            if tp.get("twd") is not None:
+                ET.SubElement(extensions, f"{{{NS_EXT}}}twd").text = f"{tp['twd']:.1f}"
+
+    ET.indent(gpx)
+    tree = ET.ElementTree(gpx)
+    tree.write(output_path, encoding="unicode", xml_declaration=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} input.rmc output.gpx", file=sys.stderr)
+        sys.exit(1)
+    convert(sys.argv[1], sys.argv[2])

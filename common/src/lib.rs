@@ -2,8 +2,10 @@ use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-pub mod buffer;
 use buffer::BufReaderDirectWriter;
+
+pub mod buffer;
+pub mod nmea;
 
 pub enum Protocol {
     TCP,
@@ -286,12 +288,14 @@ impl NetworkEndpoint {
                 });
 
                 if self.tcp_stream.len() == 0 {
-                    let stream = std::net::TcpStream::connect(self.addr).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            format!("{} ({}): {}", key, self.addr, e),
-                        )
-                    })?;
+                    let stream =
+                        std::net::TcpStream::connect_timeout(&self.addr, Duration::from_secs(30))
+                            .map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                format!("{} ({}): {}", key, self.addr, e),
+                            )
+                        })?;
 
                     // Set the stream to use keepalive
                     let sock_ref = socket2::SockRef::from(&stream);

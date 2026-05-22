@@ -6,11 +6,12 @@ use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use crate::LocationMessage;
 use crate::NetworkEndpoint;
 use crate::cache::Persistence;
 
 pub fn work_thread(
-    rx: std::sync::mpsc::Receiver<ParsedMessage>,
+    rx: std::sync::mpsc::Receiver<LocationMessage>,
     location: HashMap<String, NetworkEndpoint>,
     mmsi: u32,
     cache_dir: &str,
@@ -38,39 +39,37 @@ impl Location {
     ) -> Self {
         let now = chrono::Utc::now();
         let retry_duration = Duration::from_secs(retry_timeout);
+        log::debug!(
+            "Location forwarder created with retry timeout of {} seconds",
+            retry_timeout
+        );
 
         Self {
             location,
             persistence,
             mmsi,
-            resend_timeout: now + retry_duration,
+            resend_timeout: now,
             retry_duration,
         }
     }
 
-    fn location_loop(&mut self, rx: &Receiver<ParsedMessage>) -> io::Result<()> {
+    fn location_loop(&mut self, rx: &Receiver<LocationMessage>) -> io::Result<()> {
         const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
         log::info!(
             "Starting location loop with {} endpoints",
             self.location.len()
         );
-        self.resend_messages();
 
         loop {
+            self.resend_messages();
             match rx.recv_timeout(MESSAGE_TIMEOUT) {
-                Ok(message) => {
-                    if self.resend_timeout < chrono::Utc::now() {
-                        self.resend_messages();
-                    }
-                    log::debug!("Received message: {:?}", message);
-                    self.parse_message(&message);
+                Ok(location_message) => {
+                    log::debug!("Received message: {:?}", location_message.parsed);
+                    self.parse_message(&location_message);
                 }
                 Err(e) => match e {
-                    std::sync::mpsc::RecvTimeoutError::Timeout => {
-                        self.resend_messages();
-                        continue;
-                    }
+                    std::sync::mpsc::RecvTimeoutError::Timeout => {}
                     std::sync::mpsc::RecvTimeoutError::Disconnected => {
                         log::error!("Receiver disconnected");
                         return Err(io::Error::new(
@@ -79,18 +78,20 @@ impl Location {
                         ));
                     }
                 },
-            }
+            };
         }
     }
 
     fn resend_messages(&mut self) {
         let resend_count = self.persistence.count();
+        log::debug!("{} resend from persistence", resend_count);
         if resend_count == 0 {
-            log::debug!("No messages to resend from persistence");
             return;
         }
         let now = chrono::Utc::now();
-        if self.resend_timeout < now {
+        if self.resend_timeout > now {
+            log::debug!("Resend timeout not reached yet: {:?}", self.resend_timeout);
+
             return;
         }
         self.resend_timeout = now + self.retry_duration;
@@ -117,25 +118,23 @@ impl Location {
                         );
                         for (location, address) in self.location.iter_mut() {
                             match address.send_message(value, &location) {
-                                Ok(()) => {
-                                    match address.read_to_string() {
-                                        Ok(reply) => {
-                                            log::debug!(
-                                                "Received confirmation of receipt of {}",
-                                                reply
-                                            );
-                                            let reply = reply.trim_ascii_end();
-                                            let db_key = format!("{}@{}", location, reply);
-                                            self.persistence.remove(&db_key.into_bytes());
-                                            self.persistence.flush();
-                                        }
-                                        Err(e) => {
-                                            log::warn!("{}", e);
-                                            failing_locations.insert(location.to_owned(), 0);
-                                        }
+                                Ok(()) => match address.read_to_string() {
+                                    Ok(reply) => {
+                                        log::debug!(
+                                            "Received confirmation of receipt of {}",
+                                            reply
+                                        );
+                                        let reply = reply.trim_ascii_end();
+                                        let db_key = format!("{}@{}", location, reply);
+                                        self.persistence.remove(&db_key.into_bytes());
+                                        self.persistence.flush();
+                                        log::info!("Sent message {}", &svalue[0..svalue.len() - 2]);
                                     }
-                                    log::info!("Sent message {}", &svalue[0..svalue.len() - 2]);
-                                }
+                                    Err(e) => {
+                                        log::warn!("{}", e);
+                                        failing_locations.insert(location.to_owned(), 0);
+                                    }
+                                },
                                 Err(e) => {
                                     log::warn!("{}", e);
                                     failing_locations.insert(location.to_owned(), 0);
@@ -151,14 +150,14 @@ impl Location {
         }
     }
 
-    fn parse_message(&mut self, message: &ParsedMessage) {
+    fn parse_message(&mut self, location_message: &LocationMessage) {
         let now = chrono::Utc::now();
         const TIME_FORMAT: &str = "%H%M%S";
         const DATE_FORMAT: &str = "%d%m%y";
 
         let unique = self.persistence.next_key();
 
-        let nmea_message = match message {
+        let mut nmea_message = match &location_message.parsed {
             ParsedMessage::VesselDynamicData(message) => {
                 format!(
                     "{:08x}@{}$GNRMC,{},A,{},{},{},{},{},,,A\r\n",
@@ -167,8 +166,8 @@ impl Location {
                     now.format(TIME_FORMAT),
                     Self::format_lat_long(message.latitude, true),
                     Self::format_lat_long(message.longitude, false),
-                    "", // Speed over ground,
-                    "", // Course over ground,
+                    Self::format_option(message.sog_knots),
+                    Self::format_option(message.cog),
                     now.format(DATE_FORMAT),
                 )
             }
@@ -196,10 +195,17 @@ impl Location {
                 )
             }
             _ => {
-                log::warn!("Unsupported message type: {:?}", message);
+                log::warn!("Unsupported message type: {:?}", location_message.parsed);
                 return;
             }
         };
+
+        if let Some(wind) = &location_message.true_wind {
+            nmea_message += &format!(
+                "$IIMWV,{:.1},T,{:.1},N,A\r\n",
+                wind.direction_degrees, wind.speed_knots
+            );
+        }
 
         let nmea_bytes = nmea_message.as_bytes();
         for (location, _) in self.location.iter_mut() {
@@ -212,7 +218,6 @@ impl Location {
                 self.persistence.count()
             );
         }
-        self.resend_messages();
     }
 
     fn format_option(value: Option<f64>) -> String {

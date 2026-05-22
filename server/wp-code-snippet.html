@@ -1,0 +1,406 @@
+<link
+  rel="stylesheet"
+  href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css"
+/>
+<script
+  src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"
+  defer
+></script>
+<style>
+  #map {
+    height: 500px;
+  }
+</style>
+<div id="header">
+  <div><?php echo $name . " mmsi " . $mmsi;?></div>
+  <button onClick="window.location.reload();">Refresh</button>
+</div>
+<div id="map"></div>
+<div>
+  <h4>Legenda</h4>
+  <div id="legenda"></div>
+</div>
+<style>
+  #legenda {
+    font-size: smaller;
+  }
+  #legenda * {
+    font-size: smaller;
+  }
+  #legenda > div::after {
+    content: "";
+    clear: both;
+    display: table;
+  }
+  #legenda > div > div {
+    float: left;
+    margin: 5px;
+  }
+  #legenda > .color {
+    width: 30px;
+    height: 1em;
+  }
+  #header::after {
+    content: "";
+    clear: both;
+    display: table;
+  }
+  #header > div {
+    float: left;
+    margin: 5px;
+  }
+  #header > button {
+    float: right;
+    margin: 5px;
+  }
+  #speed-legend {
+    background: white;
+    padding: 6px 10px;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  #speed-legend .gradient-bar {
+    width: 120px;
+    height: 12px;
+    border: 1px solid #999;
+    margin: 2px 0;
+  }
+  #speed-legend .labels {
+    display: flex;
+    justify-content: space-between;
+    width: 120px;
+  }
+  .wind-arrow {
+    font-size: 14px;
+    color: #0077cc;
+    text-shadow: 0 0 2px white, 0 0 2px white;
+  }
+</style>
+<script type="module">
+  const mmsi = "<?php echo $mmsi;?>";
+  const map = L.map("map");
+  L.tileLayer("http://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution:
+      'Map data &copy; <a href="http://www.osm.org">OpenStreetMap</a>',
+  }).addTo(map);
+
+  const base_url = "https://merrimac.nl/wp-content/uploads/map/";
+  const filelist = base_url + mmsi + "_tracks.json";
+  fetch(filelist)
+    .then((response) => response.json())
+    .then((data) => processFiles(data))
+    .catch((error) => console.error("Error fetching JSON:", error));
+
+  const SPEED_ZOOM = 10;
+  const WIND_ZOOM = 12;
+
+  // Loaded track layers per year: { basic, speed, wind, trackData }
+  const yearLayers = {};
+
+  function processFiles(data) {
+    let last_file;
+
+    const start_hue = 360;
+    const end_hue = 90;
+    const step_hue = (start_hue - end_hue) / data.length;
+    let hue = start_hue;
+    const YEAR_RX = /_([^_]*)_/;
+
+    for (const file of data) {
+      const color = RgbToHex(HslToRgb(hue / 360, 1, 0.6));
+      const year = YEAR_RX.exec(file)[1];
+
+      const row = document.createElement("div");
+      const col1 = document.createElement("div");
+      col1.style.backgroundColor = color;
+      col1.style.color = color;
+      col1.className = "color";
+      col1.innerHTML = "track";
+      let col2 = document.createElement("div");
+      col2.innerHTML = year;
+      row.appendChild(col1);
+      row.appendChild(col2);
+      row.id = "legenda_" + year;
+      row.dataset.file = file;
+      row.dataset.color = color;
+      row.addEventListener("click", () => loadMapForYear(row.dataset.file));
+      document.querySelector("#legenda").appendChild(row);
+
+      last_file = file;
+      hue -= step_hue;
+    }
+
+    loadMapForYear(last_file);
+
+    if (data.length > 1) {
+      const click = document.createElement("div");
+      click.innerHTML =
+        "Click on the color box for a year to show the track for that year as well.";
+      document.querySelector("#legenda").appendChild(click);
+    }
+  }
+
+  function loadMapForYear(file) {
+    const YEAR_RX = /_([^_]*)_/;
+    const year = YEAR_RX.exec(file)[1];
+    const row = document.querySelector("#legenda_" + year);
+    const color = row.dataset.color;
+    const url = base_url + file;
+
+    fetch(url)
+      .then((res) => res.text())
+      .then((gpxText) => {
+        const trackData = parseGPX(gpxText);
+        if (trackData.length === 0) return;
+
+        // Basic track polyline (year color)
+        const latlngs = trackData.map((p) => [p.lat, p.lon]);
+        const basicTrack = L.polyline(latlngs, {
+          color: color,
+          weight: 3,
+          opacity: 0.8,
+        }).addTo(map);
+        map.fitBounds(basicTrack.getBounds());
+
+        // Speed-colored segments
+        const speedLayer = createSpeedLayer(trackData);
+
+        // Wind arrows
+        const windLayer = createWindLayer(trackData);
+
+        yearLayers[year] = {
+          basic: basicTrack,
+          speed: speedLayer,
+          wind: windLayer,
+        };
+
+        // Update legend with stats
+        if (row.childElementCount < 4) {
+          const dist = totalDistance(trackData);
+          const maxSpd = maxSpeed(trackData);
+
+          let distDiv = document.createElement("div");
+          distDiv.innerHTML = dist.toFixed(0) + " nm";
+          row.appendChild(distDiv);
+
+          let spdDiv = document.createElement("div");
+          spdDiv.innerHTML = "max " + maxSpd.toFixed(1) + " kn";
+          row.appendChild(spdDiv);
+        }
+
+        updateDetailLayers();
+      });
+  }
+
+  // Parse GPX XML, extract trackpoints with extensions
+  function parseGPX(gpxText) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(gpxText, "text/xml");
+    const trkpts = doc.querySelectorAll("trkpt");
+    const points = [];
+
+    for (const pt of trkpts) {
+      const lat = parseFloat(pt.getAttribute("lat"));
+      const lon = parseFloat(pt.getAttribute("lon"));
+      const timeEl = pt.querySelector("time");
+      const time = timeEl ? new Date(timeEl.textContent) : null;
+
+      // Extract extensions (namespace-agnostic)
+      let sog = null,
+        cog = null,
+        tws = null,
+        twd = null;
+      const ext = pt.querySelector("extensions");
+      if (ext) {
+        for (const child of ext.children) {
+          const tag = child.localName;
+          const val = parseFloat(child.textContent);
+          if (tag === "sog") sog = val;
+          else if (tag === "cog") cog = val;
+          else if (tag === "tws") tws = val;
+          else if (tag === "twd") twd = val;
+        }
+      }
+
+      points.push({ lat, lon, time, sog, cog, tws, twd });
+    }
+    return points;
+  }
+
+  // Speed color: blue (0-5 kn) -> green (5-7) -> yellow (7-9) -> red (9+)
+  function speedColor(knots) {
+    if (knots == null) return "#888";
+    if (knots < 5) return `hsl(220, 80%, ${55 - knots}%)`;  // blue
+    if (knots < 7) return `hsl(120, 80%, 40%)`;              // green
+    if (knots < 9) return `hsl(50, 100%, 45%)`;              // yellow
+    return `hsl(0, 100%, 45%)`;                               // red
+  }
+
+  function createSpeedLayer(trackData) {
+    const group = L.layerGroup();
+    for (let i = 1; i < trackData.length; i++) {
+      const p0 = trackData[i - 1];
+      const p1 = trackData[i];
+      const sog = p1.sog != null ? p1.sog : p0.sog;
+      const color = speedColor(sog);
+
+      const seg = L.polyline(
+        [
+          [p0.lat, p0.lon],
+          [p1.lat, p1.lon],
+        ],
+        { color: color, weight: 4, opacity: 0.9 }
+      );
+
+      if (sog != null) {
+        let tip = sog.toFixed(1) + " kn";
+        if (p1.tws != null) tip += " | wind " + p1.tws.toFixed(0) + " kn";
+        if (p1.time) tip += " | " + p1.time.toISOString().substring(0, 16);
+        seg.bindTooltip(tip);
+      }
+
+      group.addLayer(seg);
+    }
+    return group;
+  }
+
+  function createWindLayer(trackData) {
+    const group = L.layerGroup();
+    // Show wind arrows at reasonable intervals
+    const step = Math.max(1, Math.floor(trackData.length / 200));
+    for (let i = 0; i < trackData.length; i += step) {
+      const p = trackData[i];
+      if (p.twd == null || p.tws == null) continue;
+
+      // Arrow points in the direction the wind is going TO
+      // Meteorological convention: twd is where wind comes FROM
+      // So arrow rotation = twd (points downwind from the marker)
+      const rotation = p.twd;
+      const size = Math.min(8 + p.tws * 0.5, 20);
+
+      const icon = L.divIcon({
+        className: "wind-arrow",
+        html: `<span style="display:inline-block;transform:rotate(${rotation}deg);font-size:${size}px">\u2193</span>`,
+        iconSize: [size, size],
+        iconAnchor: [size / 2, size / 2],
+      });
+
+      const marker = L.marker([p.lat, p.lon], {
+        icon: icon,
+        interactive: false,
+      });
+      group.addLayer(marker);
+    }
+    return group;
+  }
+
+  // Toggle detail layers based on zoom level
+  function updateDetailLayers() {
+    const zoom = map.getZoom();
+    for (const layers of Object.values(yearLayers)) {
+      if (zoom >= SPEED_ZOOM) {
+        if (!map.hasLayer(layers.speed)) layers.speed.addTo(map);
+        layers.basic.setStyle({ opacity: 0.2 });
+      } else {
+        if (map.hasLayer(layers.speed)) map.removeLayer(layers.speed);
+        layers.basic.setStyle({ opacity: 0.8 });
+      }
+      if (zoom >= WIND_ZOOM) {
+        if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
+      } else {
+        if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
+      }
+    }
+
+    // Speed legend visibility
+    if (zoom >= SPEED_ZOOM) {
+      speedLegendCtrl.addTo(map);
+    } else {
+      speedLegendCtrl.remove();
+    }
+  }
+
+  map.on("zoomend", updateDetailLayers);
+
+  // Speed legend control
+  const speedLegendCtrl = L.control({ position: "bottomright" });
+  speedLegendCtrl.onAdd = function () {
+    const div = L.DomUtil.create("div", "");
+    div.id = "speed-legend";
+    div.innerHTML =
+      "<b>Speed (kn)</b><br>" +
+      '<div style="display:flex;width:120px;height:12px;border:1px solid #999;margin:2px 0">' +
+      `<div style="flex:5;background:${speedColor(2)}"></div>` +
+      `<div style="flex:2;background:${speedColor(6)}"></div>` +
+      `<div style="flex:2;background:${speedColor(8)}"></div>` +
+      `<div style="flex:2;background:${speedColor(10)}"></div>` +
+      "</div>" +
+      '<div class="labels"><span>0</span><span>5</span><span>7</span><span>9</span></div>';
+    return div;
+  };
+
+  // Haversine distance in nautical miles
+  function haversineNm(lat1, lon1, lat2, lon2) {
+    const R = 3440.065; // Earth radius in nm
+    const dLat = ((lat2 - lat1) * Math.PI) / 180;
+    const dLon = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos((lat1 * Math.PI) / 180) *
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  function totalDistance(trackData) {
+    let total = 0;
+    for (let i = 1; i < trackData.length; i++) {
+      total += haversineNm(
+        trackData[i - 1].lat,
+        trackData[i - 1].lon,
+        trackData[i].lat,
+        trackData[i].lon
+      );
+    }
+    return total;
+  }
+
+  function maxSpeed(trackData) {
+    let max = 0;
+    for (const p of trackData) {
+      if (p.sog != null && p.sog > max) max = p.sog;
+    }
+    return max;
+  }
+
+  function HslToRgb(h, s, l) {
+    var r, g, b;
+    if (s == 0) {
+      r = g = b = l;
+    } else {
+      function hue2rgb(p, q, t) {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1 / 6) return p + (q - p) * 6 * t;
+        if (t < 1 / 2) return q;
+        if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+        return p;
+      }
+      var q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+      var p = 2 * l - q;
+      r = hue2rgb(p, q, h + 1 / 3);
+      g = hue2rgb(p, q, h);
+      b = hue2rgb(p, q, h - 1 / 3);
+    }
+    return [Math.trunc(r * 255), Math.trunc(g * 255), Math.trunc(b * 255)];
+  }
+
+  function RgbToHex(rgb) {
+    const r = rgb[0];
+    const g = rgb[1];
+    const b = rgb[2];
+    return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+  }
+</script>
