@@ -1,42 +1,44 @@
 
 [general]
 # Own MMSI
-# Set this so that messages sent to 'location' are prepended with a MMSI.
-#
 mmsi = 000000000
 
-#
 # How are incoming RMC and AIS own-ship messages to be sent out as RMC
-# message?
-# Either "RMC", "AIS" or "Both" (default "Both")
-#
-rmc_source = "Both"
+# message? Either "RMC", "AIS" or "Both" (default "Both")
+rmc_source = Both
 
-#
+# Own boat static information (optional, enables synthetic AIS type 24)
+# name = YOURSHIP
+# callsign = ZZ9999
+# ship_type = 36
+# bow = 16
+# stern = 1
+# port = 1
+# starboard = 4
+
+# Wind source talker ID filter (optional, e.g. "CG")
+# If set, only MWV true wind sentences from this NMEA2000 source are used.
+# The talker ID is the 2-char encoding of the NMEA2000 address (see canboat).
+# If not set, any true wind source is accepted.
+# wind_source = CG
+
 # Time in seconds between updates for each vessel
 # The longer the less traffic is generated
-#
 interval = 10
 location_interval = 30
 
-#
 # Where to connect to that provides AIS data in NMEA-0183 format
 # This program, as of now, has been tested with canboat n2kd.
-#
 provider = tcp://127.0.0.1:2599
 
 [ais]
-#
 # Service = udp:ip-or-dns:port
 #
 # MarineTraffic = udp://5.9.207.224:99999
 # VesselFinder = udp://ais.vesselfinder.com:9999
-#
 
 [location]
-#
 # Report our own location to a different service using RMC messages
 # optionally prepended by MMSI.
-#
 
 keversoft = tcp://keversoft.com:11328

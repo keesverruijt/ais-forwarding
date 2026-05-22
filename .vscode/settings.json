@@ -13,5 +13,8 @@
         "x86_64-pc-windows-gnu",
         "aarch64-apple-darwin",
         "aarch64-unknown-linux-musl"
-    ]
+    ],
+    "[html]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    }
 }

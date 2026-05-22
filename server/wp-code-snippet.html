@@ -7,77 +7,136 @@
   defer
 ></script>
 <style>
+  #map-wrap {
+    position: relative;
+  }
   #map {
     height: 500px;
   }
-</style>
-<div id="header">
-  <div><?php echo $name . " mmsi " . $mmsi;?></div>
-  <button onClick="window.location.reload();">Refresh</button>
-</div>
-<div id="map"></div>
-<div>
-  <h4>Legenda</h4>
-  <div id="legenda"></div>
-</div>
-<style>
-  #legenda {
-    font-size: smaller;
-  }
-  #legenda * {
-    font-size: smaller;
-  }
-  #legenda > div::after {
-    content: "";
-    clear: both;
-    display: table;
-  }
-  #legenda > div > div {
-    float: left;
-    margin: 5px;
-  }
-  #legenda > .color {
-    width: 30px;
-    height: 1em;
-  }
-  #header::after {
-    content: "";
-    clear: both;
-    display: table;
-  }
-  #header > div {
-    float: left;
-    margin: 5px;
-  }
-  #header > button {
-    float: right;
-    margin: 5px;
-  }
-  #speed-legend {
+  #map-wrap:fullscreen,
+  #map-wrap.fullscreen {
     background: white;
-    padding: 6px 10px;
-    border-radius: 4px;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
-    font-size: 12px;
-    line-height: 1.4;
   }
-  #speed-legend .gradient-bar {
-    width: 120px;
-    height: 12px;
-    border: 1px solid #999;
-    margin: 2px 0;
+  #map-wrap:fullscreen #map,
+  #map-wrap.fullscreen #map {
+    height: 100vh;
   }
-  #speed-legend .labels {
+  #header {
     display: flex;
     justify-content: space-between;
-    width: 120px;
+    align-items: center;
+    padding: 4px 0;
   }
+
+  /* Legend inside map */
+  .map-legend {
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    padding: 8px 10px;
+    border-radius: 6px;
+    box-shadow: 0 1px 5px rgba(0, 0, 0, 0.25);
+    font: 12px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      sans-serif;
+    max-width: 280px;
+  }
+  .legenda-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+    transition: background 0.15s;
+  }
+  .legenda-row:hover {
+    background: rgba(0, 0, 0, 0.06);
+  }
+  .legenda-row.active {
+    background: rgba(0, 100, 200, 0.1);
+  }
+  .legenda-swatch {
+    width: 28px;
+    height: 5px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .legenda-year {
+    font-weight: 600;
+    min-width: 32px;
+  }
+  .legenda-stat {
+    color: #666;
+    white-space: nowrap;
+  }
+  .legenda-hint {
+    color: #999;
+    font-size: 10px;
+    padding: 2px 4px 0;
+  }
+  #speed-scale {
+    display: none;
+    padding: 4px;
+    margin-top: 4px;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 4px;
+  }
+  #speed-scale .title {
+    font-size: 10px;
+    color: #666;
+    margin-bottom: 2px;
+  }
+  #speed-scale .bar {
+    display: flex;
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  #speed-scale .labels {
+    display: flex;
+    font-size: 9px;
+    color: #888;
+    margin-top: 1px;
+  }
+  #speed-scale .labels > span {
+    text-align: center;
+  }
+
+  /* Fullscreen button */
+  .fullscreen-btn {
+    background: white;
+    border: 2px solid rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    width: 30px;
+    height: 30px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    line-height: 1;
+    color: #333;
+    box-shadow: none;
+  }
+  .fullscreen-btn:hover {
+    background: #f4f4f4;
+  }
+
   .wind-arrow {
     font-size: 14px;
     color: #0077cc;
     text-shadow: 0 0 2px white, 0 0 2px white;
   }
 </style>
+<div id="header">
+  <div><?php echo $name . " mmsi " . $mmsi;?></div>
+  <button type="button" onClick="window.location.reload();">Refresh</button>
+</div>
+<div id="map-wrap">
+  <div id="map"></div>
+</div>
 <script type="module">
   const mmsi = "<?php echo $mmsi;?>";
   const map = L.map("map");
@@ -93,15 +152,61 @@
     .then((data) => processFiles(data))
     .catch((error) => console.error("Error fetching JSON:", error));
 
-  const SPEED_ZOOM = 10;
-  const WIND_ZOOM = 12;
+  // --- Fullscreen control (uses native Fullscreen API) ---
+  const fullscreenCtrl = L.control({ position: "topright" });
+  fullscreenCtrl.onAdd = function () {
+    const btn = L.DomUtil.create("button", "fullscreen-btn");
+    btn.type = "button";
+    btn.title = "Toggle fullscreen";
+    btn.innerHTML = "\u26f6";
+    L.DomEvent.disableClickPropagation(btn);
+    btn.addEventListener("click", () => {
+      const wrap = document.getElementById("map-wrap");
+      if (!document.fullscreenElement) {
+        wrap.requestFullscreen().catch(() => {
+          // Fallback for browsers without Fullscreen API
+          wrap.classList.add("fullscreen");
+          map.invalidateSize();
+        });
+      } else {
+        document.exitFullscreen();
+      }
+    });
 
-  // Loaded track layers per year: { basic, speed, wind, trackData }
+    document.addEventListener("fullscreenchange", () => {
+      const isFS = !!document.fullscreenElement;
+      btn.innerHTML = isFS ? "\u2715" : "\u26f6";
+      btn.title = isFS ? "Exit fullscreen" : "Toggle fullscreen";
+      map.invalidateSize();
+    });
+
+    return btn;
+  };
+  fullscreenCtrl.addTo(map);
+
+  // --- Legend control ---
+  const legendCtrl = L.control({ position: "bottomleft" });
+  let legendDiv;
+  legendCtrl.onAdd = function () {
+    legendDiv = L.DomUtil.create("div", "map-legend");
+    L.DomEvent.disableClickPropagation(legendDiv);
+    L.DomEvent.disableScrollPropagation(legendDiv);
+    return legendDiv;
+  };
+  legendCtrl.addTo(map);
+
   const yearLayers = {};
+
+  function speedColor(knots) {
+    if (knots == null) return "#888";
+    if (knots < 5) return `hsl(220, 80%, ${55 - knots}%)`;
+    if (knots < 7) return "hsl(120, 80%, 40%)";
+    if (knots < 9) return "hsl(50, 100%, 45%)";
+    return "hsl(0, 100%, 45%)";
+  }
 
   function processFiles(data) {
     let last_file;
-
     const start_hue = 360;
     const end_hue = 90;
     const step_hue = (start_hue - end_hue) / data.length;
@@ -113,39 +218,78 @@
       const year = YEAR_RX.exec(file)[1];
 
       const row = document.createElement("div");
-      const col1 = document.createElement("div");
-      col1.style.backgroundColor = color;
-      col1.style.color = color;
-      col1.className = "color";
-      col1.innerHTML = "track";
-      let col2 = document.createElement("div");
-      col2.innerHTML = year;
-      row.appendChild(col1);
-      row.appendChild(col2);
+      row.className = "legenda-row";
       row.id = "legenda_" + year;
       row.dataset.file = file;
       row.dataset.color = color;
+
+      const swatch = document.createElement("div");
+      swatch.className = "legenda-swatch";
+      swatch.style.background = color;
+
+      const yearEl = document.createElement("span");
+      yearEl.className = "legenda-year";
+      yearEl.textContent = year;
+
+      const stats = document.createElement("span");
+      stats.className = "legenda-stat";
+      stats.id = "stats_" + year;
+
+      row.appendChild(swatch);
+      row.appendChild(yearEl);
+      row.appendChild(stats);
       row.addEventListener("click", () => loadMapForYear(row.dataset.file));
-      document.querySelector("#legenda").appendChild(row);
+      legendDiv.appendChild(row);
 
       last_file = file;
       hue -= step_hue;
     }
 
-    loadMapForYear(last_file);
+    // Speed color scale (hidden by default)
+    const scale = document.createElement("div");
+    scale.id = "speed-scale";
+    scale.innerHTML =
+      '<div class="title">Speed (knots)</div>' +
+      '<div class="bar">' +
+      `<div style="flex:5;background:${speedColor(2)}"></div>` +
+      `<div style="flex:2;background:${speedColor(6)}"></div>` +
+      `<div style="flex:2;background:${speedColor(8)}"></div>` +
+      `<div style="flex:2;background:${speedColor(10)}"></div>` +
+      "</div>" +
+      '<div class="labels">' +
+      '<span style="flex:5">0</span>' +
+      '<span style="flex:2">5</span>' +
+      '<span style="flex:2">7</span>' +
+      '<span style="flex:2">9+</span>' +
+      "</div>";
+    legendDiv.appendChild(scale);
 
     if (data.length > 1) {
-      const click = document.createElement("div");
-      click.innerHTML =
-        "Click on the color box for a year to show the track for that year as well.";
-      document.querySelector("#legenda").appendChild(click);
+      const hint = document.createElement("div");
+      hint.className = "legenda-hint";
+      hint.textContent = "Click a year to show/hide its track.";
+      legendDiv.appendChild(hint);
     }
+
+    loadMapForYear(last_file);
   }
 
   function loadMapForYear(file) {
     const YEAR_RX = /_([^_]*)_/;
     const year = YEAR_RX.exec(file)[1];
     const row = document.querySelector("#legenda_" + year);
+
+    if (yearLayers[year]) {
+      const layers = yearLayers[year];
+      map.removeLayer(layers.basic);
+      if (map.hasLayer(layers.speed)) map.removeLayer(layers.speed);
+      if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
+      delete yearLayers[year];
+      row.classList.remove("active");
+      updateDetailLayers();
+      return;
+    }
+
     const color = row.dataset.color;
     const url = base_url + file;
 
@@ -155,7 +299,6 @@
         const trackData = parseGPX(gpxText);
         if (trackData.length === 0) return;
 
-        // Basic track polyline (year color)
         const latlngs = trackData.map((p) => [p.lat, p.lon]);
         const basicTrack = L.polyline(latlngs, {
           color: color,
@@ -164,10 +307,7 @@
         }).addTo(map);
         map.fitBounds(basicTrack.getBounds());
 
-        // Speed-colored segments
         const speedLayer = createSpeedLayer(trackData);
-
-        // Wind arrows
         const windLayer = createWindLayer(trackData);
 
         yearLayers[year] = {
@@ -176,25 +316,50 @@
           wind: windLayer,
         };
 
-        // Update legend with stats
-        if (row.childElementCount < 4) {
+        row.classList.add("active");
+
+        const statsEl = document.querySelector("#stats_" + year);
+        if (!statsEl.textContent) {
           const dist = totalDistance(trackData);
           const maxSpd = maxSpeed(trackData);
-
-          let distDiv = document.createElement("div");
-          distDiv.innerHTML = dist.toFixed(0) + " nm";
-          row.appendChild(distDiv);
-
-          let spdDiv = document.createElement("div");
-          spdDiv.innerHTML = "max " + maxSpd.toFixed(1) + " kn";
-          row.appendChild(spdDiv);
+          statsEl.textContent =
+            dist.toFixed(0) + " nm, max " + maxSpd.toFixed(1) + " kn";
         }
 
         updateDetailLayers();
       });
   }
 
-  // Parse GPX XML, extract trackpoints with extensions
+  function updateDetailLayers() {
+    const years = Object.keys(yearLayers);
+    const singleYear = years.length === 1;
+
+    for (const [year, layers] of Object.entries(yearLayers)) {
+      const row = document.querySelector("#legenda_" + year);
+      const swatch = row.querySelector(".legenda-swatch");
+
+      if (singleYear) {
+        if (!map.hasLayer(layers.speed)) layers.speed.addTo(map);
+        if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
+        layers.basic.setStyle({ opacity: 0.2 });
+        swatch.style.background = `linear-gradient(to right, ${speedColor(2)} 0%, ${speedColor(2)} 45%, ${speedColor(6)} 45%, ${speedColor(6)} 63%, ${speedColor(8)} 63%, ${speedColor(8)} 82%, ${speedColor(10)} 82%)`;
+      } else {
+        if (map.hasLayer(layers.speed)) map.removeLayer(layers.speed);
+        if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
+        layers.basic.setStyle({ opacity: 0.8 });
+        swatch.style.background = row.dataset.color;
+      }
+    }
+
+    document.querySelectorAll(".legenda-row:not(.active)").forEach((row) => {
+      const swatch = row.querySelector(".legenda-swatch");
+      if (swatch) swatch.style.background = row.dataset.color;
+    });
+
+    const scaleEl = document.querySelector("#speed-scale");
+    scaleEl.style.display = singleYear ? "block" : "none";
+  }
+
   function parseGPX(gpxText) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(gpxText, "text/xml");
@@ -207,7 +372,6 @@
       const timeEl = pt.querySelector("time");
       const time = timeEl ? new Date(timeEl.textContent) : null;
 
-      // Extract extensions (namespace-agnostic)
       let sog = null,
         cog = null,
         tws = null,
@@ -227,15 +391,6 @@
       points.push({ lat, lon, time, sog, cog, tws, twd });
     }
     return points;
-  }
-
-  // Speed color: blue (0-5 kn) -> green (5-7) -> yellow (7-9) -> red (9+)
-  function speedColor(knots) {
-    if (knots == null) return "#888";
-    if (knots < 5) return `hsl(220, 80%, ${55 - knots}%)`;  // blue
-    if (knots < 7) return `hsl(120, 80%, 40%)`;              // green
-    if (knots < 9) return `hsl(50, 100%, 45%)`;              // yellow
-    return `hsl(0, 100%, 45%)`;                               // red
   }
 
   function createSpeedLayer(trackData) {
@@ -268,15 +423,11 @@
 
   function createWindLayer(trackData) {
     const group = L.layerGroup();
-    // Show wind arrows at reasonable intervals
     const step = Math.max(1, Math.floor(trackData.length / 200));
     for (let i = 0; i < trackData.length; i += step) {
       const p = trackData[i];
       if (p.twd == null || p.tws == null) continue;
 
-      // Arrow points in the direction the wind is going TO
-      // Meteorological convention: twd is where wind comes FROM
-      // So arrow rotation = twd (points downwind from the marker)
       const rotation = p.twd;
       const size = Math.min(8 + p.tws * 0.5, 20);
 
@@ -287,63 +438,15 @@
         iconAnchor: [size / 2, size / 2],
       });
 
-      const marker = L.marker([p.lat, p.lon], {
-        icon: icon,
-        interactive: false,
-      });
-      group.addLayer(marker);
+      group.addLayer(
+        L.marker([p.lat, p.lon], { icon: icon, interactive: false })
+      );
     }
     return group;
   }
 
-  // Toggle detail layers based on zoom level
-  function updateDetailLayers() {
-    const zoom = map.getZoom();
-    for (const layers of Object.values(yearLayers)) {
-      if (zoom >= SPEED_ZOOM) {
-        if (!map.hasLayer(layers.speed)) layers.speed.addTo(map);
-        layers.basic.setStyle({ opacity: 0.2 });
-      } else {
-        if (map.hasLayer(layers.speed)) map.removeLayer(layers.speed);
-        layers.basic.setStyle({ opacity: 0.8 });
-      }
-      if (zoom >= WIND_ZOOM) {
-        if (!map.hasLayer(layers.wind)) layers.wind.addTo(map);
-      } else {
-        if (map.hasLayer(layers.wind)) map.removeLayer(layers.wind);
-      }
-    }
-
-    // Speed legend visibility
-    if (zoom >= SPEED_ZOOM) {
-      speedLegendCtrl.addTo(map);
-    } else {
-      speedLegendCtrl.remove();
-    }
-  }
-
-  map.on("zoomend", updateDetailLayers);
-
-  // Speed legend control
-  const speedLegendCtrl = L.control({ position: "bottomright" });
-  speedLegendCtrl.onAdd = function () {
-    const div = L.DomUtil.create("div", "");
-    div.id = "speed-legend";
-    div.innerHTML =
-      "<b>Speed (kn)</b><br>" +
-      '<div style="display:flex;width:120px;height:12px;border:1px solid #999;margin:2px 0">' +
-      `<div style="flex:5;background:${speedColor(2)}"></div>` +
-      `<div style="flex:2;background:${speedColor(6)}"></div>` +
-      `<div style="flex:2;background:${speedColor(8)}"></div>` +
-      `<div style="flex:2;background:${speedColor(10)}"></div>` +
-      "</div>" +
-      '<div class="labels"><span>0</span><span>5</span><span>7</span><span>9</span></div>';
-    return div;
-  };
-
-  // Haversine distance in nautical miles
   function haversineNm(lat1, lon1, lat2, lon2) {
-    const R = 3440.065; // Earth radius in nm
+    const R = 3440.065;
     const dLat = ((lat2 - lat1) * Math.PI) / 180;
     const dLon = ((lon2 - lon1) * Math.PI) / 180;
     const a =

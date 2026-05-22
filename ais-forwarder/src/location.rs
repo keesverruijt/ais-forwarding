@@ -1,4 +1,4 @@
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 /// (C) 2025 by Kees Verruijt, Harlingen, Netherlands
 use nmea_parser::ParsedMessage;
 use std::collections::HashMap;
@@ -173,9 +173,14 @@ impl Location {
             }
             ParsedMessage::Rmc(message) => {
                 let ts = if let Some(ts) = message.timestamp {
-                    if (now - ts).abs() > TimeDelta::minutes(60) {
-                        log::error!("Message has weird timestamp: {:?}, using {}", message, now);
-                        now
+                    let date_diff = (now.date_naive() - ts.date_naive()).num_days().abs();
+                    if date_diff > 1 {
+                        // GPS date is stale/wrong, keep the RMC time but use today's date
+                        log::warn!(
+                            "RMC date off by {} days, using current date with RMC time",
+                            date_diff
+                        );
+                        now.date_naive().and_time(ts.time()).and_utc()
                     } else {
                         ts
                     }

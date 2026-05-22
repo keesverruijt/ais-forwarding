@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{io, path};
 
 use common::NetworkEndpoint;
-use common::nmea::{Message18, TrueWind, parse_mwv_true};
+use common::nmea::{Message18, Message24, TrueWind, parse_mwv_true};
 
 pub struct LocationMessage {
     pub parsed: ParsedMessage,
@@ -34,6 +34,17 @@ struct LastSent {
     vessel_static_data: Instant,
 }
 
+#[derive(Clone)]
+pub struct OwnShipStaticInfo {
+    name: String,
+    callsign: String,
+    ship_type: u8,
+    bow: u16,
+    stern: u16,
+    port: u8,
+    starboard: u8,
+}
+
 struct Dispatcher {
     own_ship_mmsi: u32,
     provider: NetworkEndpoint,
@@ -50,6 +61,8 @@ struct Dispatcher {
     doubtful_latitude: Option<f64>,
     doubtful_longitude: Option<f64>,
     latest_true_wind: Option<TrueWind>,
+    wind_source: Option<String>,
+    own_ship_static: Option<OwnShipStaticInfo>,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -185,6 +198,46 @@ fn main() {
         }
     };
 
+    let wind_source = general.get("wind_source").cloned();
+    if let Some(ref ws) = wind_source {
+        log::info!("Wind source filter: talker ID '{}'", ws);
+    }
+
+    let own_ship_static = general.get("name").map(|name| {
+        OwnShipStaticInfo {
+            name: name.clone(),
+            callsign: general.get("callsign").cloned().unwrap_or_default(),
+            ship_type: general
+                .get("ship_type")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(36), // Default: sailing vessel
+            bow: general
+                .get("bow")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            stern: general
+                .get("stern")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            port: general
+                .get("port")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            starboard: general
+                .get("starboard")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        }
+    });
+    if let Some(info) = &own_ship_static {
+        log::info!(
+            "Own ship static: {} {} type {}",
+            info.name,
+            info.callsign,
+            info.ship_type
+        );
+    }
+
     let (tx, rx) = std::sync::mpsc::channel::<LocationMessage>();
     let location = match settings.get("location") {
         Some(location) => location,
@@ -263,6 +316,8 @@ fn main() {
             interval,
             location_interval,
             location_anchor_interval,
+            own_ship_static.clone(),
+            wind_source.clone(),
         );
         if let Err(e) = dispatcher.work(&rmc_source) {
             log::error!("{}", e);
@@ -280,6 +335,8 @@ impl Dispatcher {
         interval: u64,
         location_interval: u64,
         location_anchor_interval: u64,
+        own_ship_static: Option<OwnShipStaticInfo>,
+        wind_source: Option<String>,
     ) -> Self {
         Dispatcher {
             own_ship_mmsi,
@@ -297,6 +354,8 @@ impl Dispatcher {
             doubtful_latitude: None,
             doubtful_longitude: None,
             latest_true_wind: None,
+            wind_source,
+            own_ship_static,
         }
     }
 
@@ -329,11 +388,13 @@ impl Dispatcher {
     fn work(&mut self, rmc_source: &RmcSource) -> io::Result<()> {
         const RMC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
         const OWN_SHIP_AIS_TIMEOUT: Duration = Duration::from_secs(60);
+        const OWN_SHIP_STATIC_INTERVAL: Duration = Duration::from_secs(300);
 
         let mut fragments = Vec::new();
         let mut last_seen_rmc_message = SystemTime::UNIX_EPOCH;
         let now = SystemTime::now();
         let mut last_own_ship_ais_sent = now;
+        let mut next_own_ship_static_ts = now; // Send immediately on start
         let mut next_location_ts = self.next_location_system_time(&now);
         let mut next_location_anchor_ts = self.next_location_anchor_system_time(&now);
         let mut next_dump_ts = now.add(Duration::from_secs(0));
@@ -369,10 +430,35 @@ impl Dispatcher {
                 }
             }
 
+            // Send own ship static data every 5 minutes if no AIS transponder
+            if now >= next_own_ship_static_ts
+                && last_own_ship_ais_sent + OWN_SHIP_AIS_TIMEOUT < now
+            {
+                if let Some(info) = &self.own_ship_static {
+                    let msg24 = Message24::new(
+                        true,
+                        self.own_ship_mmsi,
+                        &info.name,
+                        info.ship_type,
+                        &info.callsign,
+                        info.bow,
+                        info.stern,
+                        info.port,
+                        info.starboard,
+                    );
+                    for sentence in msg24.to_nmea() {
+                        self.broadcast_ais_bytes(sentence.as_bytes())?;
+                    }
+                    ais_counter += 2;
+                    log::info!("Sent own ship static data for MMSI {}", self.own_ship_mmsi);
+                }
+                next_own_ship_static_ts = now + OWN_SHIP_STATIC_INTERVAL;
+            }
+
             let message = self.provider.read_to_string()?;
 
             for line in message.lines() {
-                if let Some(wind) = parse_mwv_true(line) {
+                if let Some(wind) = parse_mwv_true(line, self.wind_source.as_deref()) {
                     self.latest_true_wind = Some(wind);
                     continue;
                 }
@@ -480,8 +566,12 @@ impl Dispatcher {
 
     fn broadcast_ais(&mut self, message: &ParsedMessage, nmea_message: &[u8]) -> io::Result<()> {
         log::trace!("Broadcasting message: {:?} / {:?}", message, nmea_message);
+        self.broadcast_ais_bytes(nmea_message)
+    }
+
+    fn broadcast_ais_bytes(&mut self, nmea_message: &[u8]) -> io::Result<()> {
         for (key, address) in self.ais.iter_mut() {
-            address.send_message(&nmea_message, key)?;
+            address.send_message(nmea_message, key)?;
         }
         Ok(())
     }

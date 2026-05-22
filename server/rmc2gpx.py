@@ -9,7 +9,7 @@ Usage: rmc2gpx.py input.rmc output.gpx
 import sys
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 
 NS = "http://www.topografix.com/GPX/1/1"
 NS_EXT = "http://merrimac.nl/gpx/ext/1"
@@ -70,10 +70,12 @@ def _parse_latlon(value, hemisphere):
     if not value or not hemisphere:
         return None
     try:
-        # Format: DDDMM.MMMMM
+        # Format: DDMM.MMMMM (lat) or DDDMM.MMMMM (lon)
+        # Some GPS omit leading zeros, so MM.MMMMM is valid (degrees=0)
         dot = value.index(".")
-        degrees = float(value[: dot - 2])
-        minutes = float(value[dot - 2 :])
+        deg_end = max(0, dot - 2)
+        degrees = float(value[:deg_end]) if deg_end > 0 else 0.0
+        minutes = float(value[deg_end:])
         result = degrees + minutes / 60.0
         if hemisphere in ("S", "W"):
             result = -result
@@ -89,6 +91,44 @@ def _parse_float(s):
         return float(s)
     except ValueError:
         return None
+
+
+def fix_stale_dates(trackpoints):
+    """Fix backward date jumps caused by GPS restarts with stale dates.
+
+    Walks the list in file order tracking the max date seen. When a record's
+    date is earlier, it belongs to a "backward group". The first record after
+    the group that has a date >= max supplies the correct date for the group.
+    Time-of-day is preserved.
+    """
+    if not trackpoints:
+        return
+
+    max_date = trackpoints[0]["time"].date()
+    i = 0
+    while i < len(trackpoints):
+        tp_date = trackpoints[i]["time"].date()
+        if tp_date >= max_date:
+            max_date = tp_date
+            i += 1
+        else:
+            # Start of backward group
+            group_start = i
+            while i < len(trackpoints) and trackpoints[i]["time"].date() < max_date:
+                i += 1
+            # i is now the first non-backward entry, or end of list
+            fix_date = trackpoints[i]["time"].date() if i < len(trackpoints) else max_date
+            count = i - group_start
+            print(
+                f"Fixing {count} records with stale date "
+                f"{trackpoints[group_start]['time'].date()} -> {fix_date}",
+                file=sys.stderr,
+            )
+            for j in range(group_start, i):
+                old = trackpoints[j]["time"]
+                trackpoints[j]["time"] = datetime.combine(
+                    fix_date, old.time(), tzinfo=timezone.utc
+                )
 
 
 def convert(input_path, output_path):
@@ -120,7 +160,9 @@ def convert(input_path, output_path):
         if pending_rmc:
             trackpoints.append(pending_rmc)
 
-    trackpoints.sort(key=lambda tp: tp["time"])
+    # Fix stale GPS dates: when the date jumps backward, use the next
+    # forward date for the backward group (GPS restarts with old date).
+    fix_stale_dates(trackpoints)
 
     # Build GPX
     gpx = ET.Element(
