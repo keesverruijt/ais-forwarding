@@ -27,8 +27,16 @@ rmc_source = Both
 interval = 10
 location_interval = 30
 
-# Where to connect to that provides AIS data in NMEA-0183 format
-# This program, as of now, has been tested with canboat n2kd.
+# Watchdog: if no input data arrives for this many seconds, the process exits
+# so a supervisor (systemd) can restart it. Set to 0 to disable. Default 300.
+input_timeout = 300
+
+# Where the incoming AIS data (NMEA-0183) comes from. One of:
+#   tcp://host:port          connect to a TCP server (e.g. canboat n2kd)
+#   tcp-listen://0.0.0.0:port accept incoming TCP connections
+#   udp://0.0.0.0:port       listen for UDP datagrams
+#   serial:///dev/ttyUSB0    read from a serial device (default 38400 baud)
+#   serial:///dev/ttyUSB0:38400   serial device with explicit baud rate
 provider = tcp://127.0.0.1:2599
 
 [ais]
@@ -38,7 +46,22 @@ provider = tcp://127.0.0.1:2599
 # VesselFinder = udp://ais.vesselfinder.com:9999
 
 [location]
-# Report our own location to a different service using RMC messages
-# optionally prepended by MMSI.
+# Optional. Report our own location to a different service using RMC messages
+# optionally prepended by MMSI. Omit the whole section (or leave it empty) to
+# disable location/RMC forwarding entirely (no sled cache is created either).
 
 keversoft = tcp://keversoft.com:11328
+
+[web]
+# Built-in read-only web UI (Map + Status pages). Omit the whole section, or
+# leave out `bind`, to disable it. Bind to 0.0.0.0 when a reverse proxy on
+# another host fronts it (see deploy/nginx.conf); bind to 127.0.0.1 if the
+# proxy is local. The app is path-agnostic — it works at / or under a subpath.
+bind = 0.0.0.0:8080
+
+# Title shown in the sidebar and browser tab.
+title = AIS Harlingen
+
+# Receiver (station) position, shown as the antenna marker on the map.
+station_lat = 53.18013
+station_lon = 5.42881

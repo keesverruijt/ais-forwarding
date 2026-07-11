@@ -12,6 +12,7 @@ pub enum Protocol {
     UDP,
     TCPListen,
     UDPListen,
+    Serial,
 }
 impl std::str::FromStr for Protocol {
     type Err = std::io::Error;
@@ -21,6 +22,7 @@ impl std::str::FromStr for Protocol {
             "udp" => Ok(Protocol::UDP),
             "tcp-listen" => Ok(Protocol::TCPListen),
             "udp-listen" => Ok(Protocol::UDPListen),
+            "serial" => Ok(Protocol::Serial),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Invalid protocol",
@@ -35,17 +37,13 @@ impl std::fmt::Display for Protocol {
             Protocol::UDP => write!(f, "udp"),
             Protocol::TCPListen => write!(f, "tcp-listen"),
             Protocol::UDPListen => write!(f, "udp-listen"),
+            Protocol::Serial => write!(f, "serial"),
         }
     }
 }
 impl std::fmt::Debug for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Protocol::TCP => write!(f, "tcp"),
-            Protocol::UDP => write!(f, "udp"),
-            Protocol::TCPListen => write!(f, "tcp-listen"),
-            Protocol::UDPListen => write!(f, "udp-listen"),
-        }
+        write!(f, "{}", self)
     }
 }
 
@@ -55,7 +53,13 @@ pub struct NetworkEndpoint {
     pub tcp_listener: Option<std::net::TcpListener>,
     pub tcp_stream: Vec<BufReaderDirectWriter<std::net::TcpStream>>, // List of connected incoming TCP streams or single outgoing stream
     pub udp_socket: Option<std::net::UdpSocket>,
+    pub serial_path: Option<String>, // Device path for Protocol::Serial
+    pub serial_baud: u32,            // Baud rate for Protocol::Serial
+    pub serial_reader: Option<io::BufReader<Box<dyn serialport::SerialPort>>>,
 }
+
+/// Standard AIS receivers emit NMEA-0183 at 38400 baud.
+const DEFAULT_SERIAL_BAUD: u32 = 38400;
 
 impl std::str::FromStr for NetworkEndpoint {
     type Err = std::io::Error;
@@ -71,6 +75,35 @@ impl std::str::FromStr for NetworkEndpoint {
         let protocol = parts[0]
             .parse::<Protocol>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+
+        // Serial endpoints have no socket address; parse `path[:baud]` instead.
+        // e.g. serial:///dev/ttyUSB0:38400  or  serial://COM3
+        if let Protocol::Serial = protocol {
+            let rest = parts[1];
+            let (path, baud) = match rest.rsplit_once(':') {
+                Some((p, b)) if !p.is_empty() && b.parse::<u32>().is_ok() => {
+                    (p.to_string(), b.parse().unwrap())
+                }
+                _ => (rest.to_string(), DEFAULT_SERIAL_BAUD),
+            };
+            if path.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Serial endpoint requires a device path",
+                ));
+            }
+            return Ok(NetworkEndpoint {
+                protocol,
+                addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                tcp_listener: None,
+                tcp_stream: Vec::new(),
+                udp_socket: None,
+                serial_path: Some(path),
+                serial_baud: baud,
+                serial_reader: None,
+            });
+        }
+
         let mut addr = parts[1].to_socket_addrs().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -86,17 +119,28 @@ impl std::str::FromStr for NetworkEndpoint {
             tcp_listener: None,
             tcp_stream: Vec::new(),
             udp_socket: None,
+            serial_path: None,
+            serial_baud: DEFAULT_SERIAL_BAUD,
+            serial_reader: None,
         })
     }
 }
 impl std::fmt::Display for NetworkEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}://{}", self.protocol, self.addr)
+        match self.protocol {
+            Protocol::Serial => write!(
+                f,
+                "serial://{}:{}",
+                self.serial_path.as_deref().unwrap_or("?"),
+                self.serial_baud
+            ),
+            _ => write!(f, "{}://{}", self.protocol, self.addr),
+        }
     }
 }
 impl std::fmt::Debug for NetworkEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}://{}", self.protocol, self.addr)
+        write!(f, "{}", self)
     }
 }
 impl std::convert::From<NetworkEndpoint> for SocketAddr {
@@ -250,6 +294,46 @@ impl NetworkEndpoint {
                     return read_message_udp(udp_socket);
                 }
             }
+
+            Protocol::Serial => {
+                if self.serial_reader.is_none() {
+                    let path = self.serial_path.clone().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "No serial device path")
+                    })?;
+                    let port = serialport::new(&path, self.serial_baud)
+                        .timeout(Duration::from_secs(30))
+                        .open()
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                format!("serial {}: {}", self, e),
+                            )
+                        })?;
+                    log::info!("Opened {}", self);
+                    self.serial_reader = Some(io::BufReader::new(port));
+                }
+                if let Some(reader) = self.serial_reader.as_mut() {
+                    let mut buffer = String::with_capacity(110);
+                    match reader.read_line(&mut buffer) {
+                        Ok(0) => {
+                            // EOF: device disappeared (e.g. USB unplugged). Drop and retry.
+                            self.serial_reader = None;
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "serial device closed",
+                            ));
+                        }
+                        Ok(_) => return Ok(buffer),
+                        Err(e) => {
+                            self.serial_reader = None;
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("serial read {}: {}", self, e),
+                            ));
+                        }
+                    }
+                }
+            }
         }
         Err(io::Error::new(
             io::ErrorKind::Other,
@@ -272,6 +356,7 @@ impl NetworkEndpoint {
             }
             Protocol::UDP => self.udp_socket.is_some(),
             Protocol::UDPListen => true,
+            Protocol::Serial => self.serial_reader.is_some(),
         }
     }
 
@@ -343,7 +428,8 @@ impl NetworkEndpoint {
                     })?;
                 }
             }
-            Protocol::TCPListen | Protocol::UDPListen => {}
+            // Listeners and serial inputs are receive-only; nothing to send.
+            Protocol::TCPListen | Protocol::UDPListen | Protocol::Serial => {}
         }
         Ok(())
     }

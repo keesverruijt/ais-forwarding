@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIS Dispatcher — Status</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div class="brand-text">
+          <div class="brand-title" data-title>AIS Dispatcher</div>
+          <div class="brand-sub">AIS forwarder</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a class="nav-item" href=".">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M15 19l-6-2.1L4 19V5l5-2 6 2.1L20 3v14l-5 2zm-6-4.3l6 2.1V6.2L9 4.1z"/></svg>
+          <span>Map</span>
+        </a>
+        <a class="nav-item active" href="status">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M11 2v20a10 10 0 0 1-1-19.9zM13 2a10 10 0 0 1 9 9h-9zm0 11h9a10 10 0 0 1-9 9z"/></svg>
+          <span>Status</span>
+        </a>
+      </nav>
+      <div class="sidebar-foot">Version 1.0</div>
+    </aside>
+
+    <main class="content status-content">
+      <header class="topbar">
+        <h1>Status</h1>
+        <div class="refresh" title="Time until the next automatic update">
+          <span class="dot" id="refresh-dot"></span>
+          <span id="countdown">15</span>s
+        </div>
+      </header>
+
+      <div class="cards">
+        <section class="card">
+          <h2>General</h2>
+          <h3>Input</h3>
+          <table class="kv">
+            <tr><td>VDM messages</td><td id="in-vdm">0</td></tr>
+            <tr><td>Non-VDM messages</td><td id="in-nonvdm">0</td></tr>
+            <tr><td>CRC errors</td><td id="in-crc">0</td></tr>
+            <tr><td>Duplicates</td><td id="in-dup">0</td></tr>
+            <tr><td>Channel A</td><td id="in-a">0</td></tr>
+            <tr><td>Channel B</td><td id="in-b">0</td></tr>
+            <tr><td>Bytes</td><td id="in-bytes">0</td></tr>
+            <tr><td>Bandwidth</td><td id="in-bw">0</td></tr>
+          </table>
+          <h3>Output</h3>
+          <table class="kv">
+            <tr><td>In/Out ratio</td><td id="out-ratio">0</td></tr>
+            <tr><td>Bytes</td><td id="out-bytes">0</td></tr>
+            <tr><td>Bandwidth</td><td id="out-bw">0</td></tr>
+          </table>
+          <div id="dests" class="dests"></div>
+        </section>
+
+        <section class="card">
+          <h2>Input statistics</h2>
+          <div class="card-sub">by AIS message type 1..27</div>
+          <div id="typegrid" class="typegrid"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="status.js"></script>
+</body>
+</html>

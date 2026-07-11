@@ -18,6 +18,37 @@ This can support any number of AIS and location services.
 
 ais-forwarder-rs, as the name implies, is written in Rust.
 
+## Input sources
+
+The `provider` in `config.ini` can be a TCP client/server, a UDP listener, or a
+serial device — so ais-forwarder can act as a drop-in replacement for the
+vesselfinder/AISHub "AIS Dispatcher" reading straight off a serial AIS receiver:
+
+```
+provider = serial:///dev/ttyUSB0:38400
+```
+
+See `config.ini.demo` for all the forms.
+
+## Built-in web UI
+
+With a `[web]` section configured, ais-forwarder serves a small read-only web
+interface with two pages, mirroring the AIS Dispatcher layout:
+
+- **Map** — live vessel positions on a MapLibre GL map (OpenStreetMap base with
+  the OpenSeaMap seamark overlay, no API key), the receiver's own antenna marker,
+  a nautical + metric scale, a ship search box, a cursor lat/lon readout, and a
+  15-second auto-refresh with a visible countdown.
+- **Status** — input/output byte and message counters (bandwidth over a rolling
+  60-second window), CRC errors, per-channel and per-AIS-message-type (1..27)
+  breakdowns, and per-destination output counts.
+
+MapLibre GL is vendored into the binary, so the page loads no third-party
+scripts; only the map tiles are fetched from OpenStreetMap and OpenSeaMap.
+The app is path-agnostic and is meant to run behind a reverse proxy; a hardened
+nginx config (TLS, microcaching, rate/connection limits) for hosting it under a
+subpath is in [`deploy/`](deploy/).
+
 
 ## To use
 

@@ -21,6 +21,8 @@ pub struct LocationMessage {
 
 mod cache;
 mod location;
+mod state;
+mod web;
 
 #[derive(PartialEq)]
 enum RmcSource {
@@ -49,7 +51,7 @@ struct Dispatcher {
     own_ship_mmsi: u32,
     provider: NetworkEndpoint,
     ais: HashMap<String, NetworkEndpoint>,
-    location_tx: Sender<LocationMessage>,
+    location_tx: Option<Sender<LocationMessage>>,
     interval: u64,
     location_interval: u64,
     location_anchor_interval: u64,
@@ -65,6 +67,7 @@ struct Dispatcher {
     own_ship_static: Option<OwnShipStaticInfo>,
     ais_msg_count: HashMap<String, u64>,
     next_ais_stats_ts: SystemTime,
+    state: state::Shared,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -240,38 +243,90 @@ fn main() {
         );
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<LocationMessage>();
-    let location = match settings.get("location") {
-        Some(location) => location,
-        None => {
-            log::error!("Missing [location] section in config.ini");
-            exit(1);
+    // [location] is optional. When it is present (and non-empty) we spin up the
+    // location forwarder thread and hand the dispatcher a Sender; when it is
+    // absent we skip the channel, the sled cache and all RMC forwarding.
+    let location_tx: Option<Sender<LocationMessage>> = match settings.get("location") {
+        Some(location) if !location.is_empty() => {
+            let (tx, rx) = std::sync::mpsc::channel::<LocationMessage>();
+            let location: HashMap<String, NetworkEndpoint> = location
+                .into_iter()
+                .map(|(key, value)| {
+                    let address = value
+                        .parse::<NetworkEndpoint>()
+                        .map_err(|e| {
+                            log::error!("Invalid address '{}' in config.ini: {}", value, e);
+                            exit(1);
+                        })
+                        .unwrap();
+                    (key.clone(), address)
+                })
+                .collect();
+            Builder::new()
+                .name("location".to_string())
+                .spawn(move || {
+                    location::work_thread(
+                        rx,
+                        location,
+                        mmsi,
+                        cli.cache_dir.as_str(),
+                        location_retry_interval,
+                    );
+                })
+                .unwrap();
+            Some(tx)
         }
-    }
-    .into_iter()
-    .map(|(key, value)| {
-        let address = value
-            .parse::<NetworkEndpoint>()
-            .map_err(|e| {
-                log::error!("Invalid address '{}' in config.ini: {}", value, e);
-                exit(1);
+        _ => {
+            log::info!("No [location] section; location/RMC forwarding disabled");
+            None
+        }
+    };
+
+    // Optional built-in web UI (Map + Status). Configured under [web]; if the
+    // section is absent the web server is simply not started.
+    let shared_state = {
+        let web = settings.get("web");
+        let get = |k: &str| web.and_then(|w| w.get(k)).cloned();
+        let title = get("title").unwrap_or_else(|| "AIS Dispatcher".to_string());
+        let station_lat = get("station_lat").and_then(|v| v.parse::<f64>().ok());
+        let station_lon = get("station_lon").and_then(|v| v.parse::<f64>().ok());
+        let st = state::AisState::new(title, mmsi, station_lat, station_lon);
+        if let Some(bind) = get("bind") {
+            web::spawn(&bind, st.clone());
+        } else {
+            log::info!("No [web] bind configured; web UI disabled");
+        }
+        st
+    };
+
+    // No-data watchdog: if no input line arrives for `input_timeout` seconds,
+    // exit so a supervisor (systemd) restarts us. Set input_timeout = 0 in
+    // [general] to disable. Default 300s (5 minutes).
+    let input_timeout = general
+        .get("input_timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    if input_timeout > 0 {
+        let st = shared_state.clone();
+        Builder::new()
+            .name("watchdog".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(30));
+                    let idle = st.lock().unwrap().idle_seconds();
+                    if idle >= input_timeout {
+                        log::error!(
+                            "No input data for {}s (limit {}s); exiting for supervisor restart",
+                            idle,
+                            input_timeout
+                        );
+                        exit(1);
+                    }
+                }
             })
             .unwrap();
-        (key.clone(), address)
-    })
-    .collect();
-    Builder::new()
-        .name("location".to_string())
-        .spawn(move || {
-            location::work_thread(
-                rx,
-                location,
-                mmsi,
-                cli.cache_dir.as_str(),
-                location_retry_interval,
-            );
-        })
-        .unwrap();
+        log::info!("No-data watchdog armed at {}s", input_timeout);
+    }
 
     loop {
         let provider = match general
@@ -314,12 +369,13 @@ fn main() {
             own_ship_info,
             provider,
             ais,
-            tx.clone(),
+            location_tx.clone(),
             interval,
             location_interval,
             location_anchor_interval,
             own_ship_static.clone(),
             wind_source.clone(),
+            shared_state.clone(),
         );
         if let Err(e) = dispatcher.work(&rmc_source) {
             log::error!("{}", e);
@@ -333,12 +389,13 @@ impl Dispatcher {
         own_ship_mmsi: u32,
         provider: NetworkEndpoint,
         ais: HashMap<String, NetworkEndpoint>,
-        location_tx: Sender<LocationMessage>,
+        location_tx: Option<Sender<LocationMessage>>,
         interval: u64,
         location_interval: u64,
         location_anchor_interval: u64,
         own_ship_static: Option<OwnShipStaticInfo>,
         wind_source: Option<String>,
+        state: state::Shared,
     ) -> Self {
         Dispatcher {
             own_ship_mmsi,
@@ -360,6 +417,7 @@ impl Dispatcher {
             own_ship_static,
             ais_msg_count: HashMap::new(),
             next_ais_stats_ts: SystemTime::now() + Duration::from_secs(3600),
+            state,
         }
     }
 
@@ -466,6 +524,8 @@ impl Dispatcher {
             let message = self.provider.read_to_string()?;
 
             for line in message.lines() {
+                self.state.lock().unwrap().record_input_line(line);
+
                 if let Some(wind) = parse_mwv_true(line, self.wind_source.as_deref()) {
                     self.latest_true_wind = Some(wind);
                     continue;
@@ -477,6 +537,10 @@ impl Dispatcher {
                             fragments.push(line.to_string());
                             continue;
                         }
+
+                        // Keep the live map registry current for every vessel we
+                        // decode, whether or not it gets forwarded upstream.
+                        self.state.lock().unwrap().update_vessel(&parsed_message);
 
                         if let (Some(own_vessel), lat, long) = match &parsed_message {
                             ParsedMessage::VesselDynamicData(data) => {
@@ -509,6 +573,13 @@ impl Dispatcher {
                             if self.check_last_sent(&parsed_message) {
                                 ais_counter += 1;
                                 self.broadcast_ais(&parsed_message, fragments.join("").as_bytes())?;
+                            } else if matches!(
+                                parsed_message,
+                                ParsedMessage::VesselDynamicData(_)
+                                    | ParsedMessage::VesselStaticData(_)
+                            ) {
+                                // Suppressed by the per-MMSI downsampling interval.
+                                self.state.lock().unwrap().record_duplicate();
                             }
 
                             if own_vessel && self.validate_position(lat, long) {
@@ -548,13 +619,14 @@ impl Dispatcher {
                                     self.prev_latitude = lat;
                                     self.prev_longitude = long;
                                     self.last_sent_location = now;
-                                    log::debug!("Forwarding location: {:?}", parsed_message);
-                                    self.location_tx
-                                        .send(LocationMessage {
+                                    if let Some(tx) = &self.location_tx {
+                                        log::debug!("Forwarding location: {:?}", parsed_message);
+                                        tx.send(LocationMessage {
                                             parsed: parsed_message,
                                             true_wind: self.latest_true_wind.clone(),
                                         })
                                         .unwrap();
+                                    }
                                     next_location_ts = self.next_location_system_time(&now);
                                     next_location_anchor_ts =
                                         self.next_location_anchor_system_time(&now);
@@ -583,6 +655,7 @@ impl Dispatcher {
         for (key, address) in self.ais.iter_mut() {
             address.send_message(msg, key)?;
             *self.ais_msg_count.entry(key.clone()).or_insert(0) += 1;
+            self.state.lock().unwrap().record_output(key, msg.len());
         }
         Ok(())
     }

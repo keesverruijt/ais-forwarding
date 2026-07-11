@@ -10,3 +10,4 @@ log = "0.4.28"
 nmea-parser = { path = "../../nmea-parser" }
 udp-stream = "0.0.12"
 socket2 = "0.5.10"
+serialport = { version = "4.7", default-features = false }

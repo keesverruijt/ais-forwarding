@@ -277,6 +277,64 @@ pub fn calculate_checksum(input: &str) -> u8 {
     checksum
 }
 
+/// Verify the NMEA-0183 checksum of a sentence.
+/// Returns `Some(true)` if the `*XX` checksum matches the computed XOR of the
+/// body, `Some(false)` if it is present but wrong, and `None` if the sentence
+/// carries no checksum (so it can't be counted as a CRC error).
+pub fn verify_checksum(sentence: &str) -> Option<bool> {
+    let sentence = sentence.trim();
+    let start = sentence.find(['!', '$'])?;
+    let star = sentence.rfind('*')?;
+    if star <= start {
+        return None;
+    }
+    let body = &sentence[start + 1..star];
+    let given = &sentence[star + 1..];
+    // Checksum is exactly two hex digits.
+    if given.len() < 2 {
+        return None;
+    }
+    let given = u8::from_str_radix(&given[..2], 16).ok()?;
+    Some(calculate_checksum(body) == given)
+}
+
+/// For an `!AIVDM`/`!AIVDO` sentence, return `(message_type, channel)` where
+/// `message_type` is the AIS message id (1..27) and `channel` is 'A'/'B'
+/// (or '?' if absent). Only the first fragment of a multi-part sentence carries
+/// the message id, so `None` is returned for continuation fragments and for
+/// non-AIS sentences.
+pub fn ais_message_type(sentence: &str) -> Option<(u8, char)> {
+    let sentence = sentence.trim();
+    let body = sentence.strip_prefix('!')?;
+    if !body.starts_with("AIVDM") && !body.starts_with("AIVDO") {
+        return None;
+    }
+    let body = body.split('*').next()?;
+    let fields: Vec<&str> = body.split(',').collect();
+    // !AIVDM,<count>,<idx>,<seq>,<channel>,<payload>,<fill>
+    if fields.len() < 6 {
+        return None;
+    }
+    // Only fragment 1 holds the message type in the first payload character.
+    if fields[2] != "1" {
+        return None;
+    }
+    let channel = fields[4].chars().next().unwrap_or('?');
+    let channel = match channel {
+        '1' => 'A',
+        '2' => 'B',
+        c => c,
+    };
+    let first = fields[5].bytes().next()?;
+    // Reverse the 6-bit ASCII armouring of the first payload character.
+    let mut v = first.wrapping_sub(48);
+    if v > 40 {
+        v = v.wrapping_sub(8);
+    }
+    let msg_type = v & 0x3F;
+    Some((msg_type, channel))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +366,40 @@ mod tests {
     fn test_parse_mwv_knots() {
         let wind = parse_mwv_true("$IIMWV,270.0,T,15.0,N,A*00", None).unwrap();
         assert!((wind.speed_knots - 15.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_verify_checksum() {
+        // Known-good AIS type 1 sentence.
+        assert_eq!(
+            verify_checksum("!AIVDM,1,1,,A,13aG?PP000Pk;;`MD5@dNww>0<0M,0*4F"),
+            Some(true)
+        );
+        // Flip a payload byte -> checksum must fail.
+        assert_eq!(
+            verify_checksum("!AIVDM,1,1,,A,X3aG?PP000Pk;;`MD5@dNww>0<0M,0*4F"),
+            Some(false)
+        );
+        // No checksum at all.
+        assert_eq!(verify_checksum("$GPGGA,,,,,"), None);
+    }
+
+    #[test]
+    fn test_ais_message_type() {
+        // Type 1, channel A.
+        assert_eq!(
+            ais_message_type("!AIVDM,1,1,,A,13aG?PP000Pk;;`MD5@dNww>0<0M,0*4F"),
+            Some((1, 'A'))
+        );
+        // Type 5 (static), first fragment of two, channel B.
+        assert_eq!(
+            ais_message_type("!AIVDM,2,1,3,B,55P5TL01VIaAL@7WKO@mBpl,0*4D"),
+            Some((5, 'B'))
+        );
+        // Continuation fragment carries no message type.
+        assert_eq!(ais_message_type("!AIVDM,2,2,3,B,88888888880,2*24"), None);
+        // Not an AIS sentence.
+        assert_eq!(ais_message_type("$GPRMC,,A,,,,,,,,,"), None);
     }
 
     #[test]
