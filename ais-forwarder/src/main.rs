@@ -93,6 +93,8 @@ fn main() {
     let log_level = cli.verbose.log_level_filter();
     let mut logger = env_logger::Builder::from_env(Env::default());
     logger.filter_level(log_level);
+    // sled is noisy (recovery/flush chatter); silence it regardless of level.
+    logger.filter_module("sled", log::LevelFilter::Off);
     // When running as a procd daemon, the PWD environment variable is not set
     // which can be used to shorten the logging records that already contain the timestamp.
     if std::env::var("PWD").is_err() {
@@ -216,10 +218,7 @@ fn main() {
                 .get("ship_type")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(36), // Default: sailing vessel
-            bow: general
-                .get("bow")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            bow: general.get("bow").and_then(|v| v.parse().ok()).unwrap_or(0),
             stern: general
                 .get("stern")
                 .and_then(|v| v.parse().ok())
@@ -451,12 +450,21 @@ impl Dispatcher {
         const RMC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
         const OWN_SHIP_AIS_TIMEOUT: Duration = Duration::from_secs(60);
         const OWN_SHIP_STATIC_INTERVAL: Duration = Duration::from_secs(300);
+        // Consider ourselves "actively synthesizing" if we emitted a synthetic
+        // dynamic within this window; static is only sent while that holds.
+        const OWN_SHIP_SYNTH_ACTIVE: Duration = Duration::from_secs(120);
 
         let mut fragments = Vec::new();
         let mut last_seen_rmc_message = SystemTime::UNIX_EPOCH;
         let now = SystemTime::now();
-        let mut last_own_ship_ais_sent = now;
-        let mut next_own_ship_static_ts = now; // Send immediately on start
+        // Own-ship AIS synthesis (only used when the boat has no transponder):
+        //  last_real_own_dynamic_ts  -> last real own VDO heard (transponder present)
+        //  last_synth_dynamic_ts     -> last time we synthesized own dynamic (synth active)
+        // Both start "long ago" so synthesis may begin immediately on a cold
+        // start / reconnect when no transponder is present.
+        let mut last_real_own_dynamic_ts = SystemTime::UNIX_EPOCH;
+        let mut last_synth_dynamic_ts = SystemTime::UNIX_EPOCH;
+        let mut next_own_ship_static_ts = now; // becomes due as soon as synth starts
         let mut next_location_ts = self.next_location_system_time(&now);
         let mut next_location_anchor_ts = self.next_location_anchor_system_time(&now);
         let mut next_dump_ts = now.add(Duration::from_secs(0));
@@ -496,9 +504,13 @@ impl Dispatcher {
                 self.log_ais_stats();
             }
 
-            // Send own ship static data every 5 minutes if no AIS transponder
+            // Send own ship static data periodically, but ONLY while we are
+            // synthesizing our own dynamic messages -- i.e. no real transponder
+            // VDO has been heard, and we actually emitted a synthetic dynamic
+            // recently (so we don't advertise a static-only ghost with no fix).
             if now >= next_own_ship_static_ts
-                && last_own_ship_ais_sent + OWN_SHIP_AIS_TIMEOUT < now
+                && last_real_own_dynamic_ts + OWN_SHIP_AIS_TIMEOUT < now
+                && last_synth_dynamic_ts + OWN_SHIP_SYNTH_ACTIVE >= now
             {
                 if let Some(info) = &self.own_ship_static {
                     let msg24 = Message24::new(
@@ -545,7 +557,8 @@ impl Dispatcher {
                         if let (Some(own_vessel), lat, long) = match &parsed_message {
                             ParsedMessage::VesselDynamicData(data) => {
                                 if data.own_vessel || data.mmsi == self.own_ship_mmsi {
-                                    last_own_ship_ais_sent = now;
+                                    // A real transponder is present; suppresses synthesis.
+                                    last_real_own_dynamic_ts = now;
                                 }
                                 (
                                     Some(
@@ -582,11 +595,14 @@ impl Dispatcher {
                                 self.state.lock().unwrap().record_duplicate();
                             }
 
-                            if own_vessel && self.validate_position(lat, long) {
-                                if last_own_ship_ais_sent + OWN_SHIP_AIS_TIMEOUT < now
+                            if own_vessel && self.validate_position(lat, long, line) {
+                                // Synthesize own-ship dynamic from RMC only when no real
+                                // transponder is present, rate-limited to once per timeout.
+                                if last_real_own_dynamic_ts + OWN_SHIP_AIS_TIMEOUT < now
+                                    && last_synth_dynamic_ts + OWN_SHIP_AIS_TIMEOUT < now
                                     && let ParsedMessage::Rmc(data) = &parsed_message
                                 {
-                                    last_own_ship_ais_sent = now;
+                                    last_synth_dynamic_ts = now;
                                     ais_counter += 1;
                                     let dynamic_update_message = Message18::new(
                                         true,
@@ -598,6 +614,11 @@ impl Dispatcher {
                                         None,
                                     );
                                     let nmea_message = dynamic_update_message.to_nmea();
+                                    log::debug!(
+                                        "Sending own ship dynamic data for MMSI {}: {:?}",
+                                        self.own_ship_mmsi,
+                                        nmea_message
+                                    );
                                     self.broadcast_ais(&parsed_message, nmea_message.as_bytes())?;
                                 }
 
@@ -752,9 +773,20 @@ impl Dispatcher {
         return false;
     }
 
-    fn validate_position(&mut self, latitude: Option<f64>, longitude: Option<f64>) -> bool {
+    // Sanity-check an own-ship position before forwarding it. A rejected fix is
+    // a normal, transient condition (the next fix is used instead), so these are
+    // logged at debug level with the offending values rather than spamming warn.
+    fn validate_position(
+        &mut self,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+        raw: &str,
+    ) -> bool {
         if latitude.is_none() || longitude.is_none() {
-            log::warn!("Invalid position: latitude or longitude is None");
+            log::debug!(
+                "Skipping own position: latitude or longitude is None [{}]",
+                raw
+            );
             return false;
         }
         let latitude = latitude.unwrap();
@@ -762,23 +794,41 @@ impl Dispatcher {
         let latitude_abs = latitude.abs();
         let longitude_abs = longitude.abs();
         if latitude_abs > 90.0 || longitude_abs > 180.0 {
-            log::warn!("Invalid position: latitude or longitude out of range");
+            log::warn!(
+                "Skipping own position: out of range (lat {:.5}, lon {:.5}) [{}]",
+                latitude,
+                longitude,
+                raw
+            );
             return false;
         }
         if latitude_abs < 0.01 || longitude_abs < 0.01 {
-            log::warn!("Invalid position: latitude and longitude are too close to zero");
+            log::debug!(
+                "Skipping own position: too close to zero (lat {:.5}, lon {:.5}) [{}]",
+                latitude,
+                longitude,
+                raw
+            );
             return false;
         }
         if let Some(prev_latitude) = self.prev_latitude {
             if (latitude - prev_latitude).abs() >= 2.00 {
                 if let Some(doubtful_latitude) = self.doubtful_latitude {
                     if (latitude - doubtful_latitude).abs() >= 2.00 {
-                        log::warn!("Doubtful position: latitude change is too big");
+                        log::debug!(
+                            "Skipping own position: latitude jump to {:.5} [{}]",
+                            latitude,
+                            raw
+                        );
                         self.doubtful_latitude = Some(latitude);
                         return false;
                     }
                 } else {
-                    log::warn!("Invalid position: latitude change is too big");
+                    log::debug!(
+                        "Skipping own position: latitude jump to {:.5} [{}]",
+                        latitude,
+                        raw
+                    );
                     self.doubtful_latitude = Some(latitude);
                     return false;
                 }
@@ -788,12 +838,20 @@ impl Dispatcher {
             if (longitude - prev_longitude).abs() >= 2.00 {
                 if let Some(doubtful_longitude) = self.doubtful_longitude {
                     if (longitude - doubtful_longitude).abs() >= 2.00 {
-                        log::warn!("Doubtful position: longitude change is too big");
+                        log::debug!(
+                            "Skipping own position: longitude jump to {:.5} [{}]",
+                            longitude,
+                            raw
+                        );
                         self.doubtful_longitude = Some(longitude);
                         return false;
                     }
                 } else {
-                    log::warn!("Invalid position: longitude change is too big");
+                    log::debug!(
+                        "Skipping own position: longitude jump to {:.5} [{}]",
+                        longitude,
+                        raw
+                    );
                     self.doubtful_longitude = Some(longitude);
                     return false;
                 }
