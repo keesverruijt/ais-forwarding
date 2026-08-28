@@ -140,7 +140,11 @@ impl Message18 {
         binary_str += "1100000000000000110"; // Communication state
 
         let sentence = if self.own_ship { "AIVDO" } else { "AIVDM" };
-        let content = format!("{},1,1,,A,{}", sentence, to_6bit_ascii(&binary_str));
+        // The trailing `,0` is the mandatory fill-bits field. Message 18 is
+        // exactly 168 bits (28 six-bit chars), so there are never any fill bits,
+        // but strict decoders reject the sentence outright when the field is
+        // absent -- MarineTraffic silently drops such position reports.
+        let content = format!("{},1,1,,A,{},0", sentence, to_6bit_ascii(&binary_str));
         let checksum = calculate_checksum(&content);
         format!("!{}*{:02X}", content, checksum)
     }
@@ -402,6 +406,45 @@ mod tests {
         assert_eq!(ais_message_type("$GPRMC,,A,,,,,,,,,"), None);
     }
 
+    /// A well-formed `!AIVDM`/`!AIVDO` sentence has seven comma-separated
+    /// fields: count, number, sequence id, channel, payload and fill bits.
+    /// Lenient decoders (including the `nmea_parser` crate used above) accept
+    /// a missing fill-bits field; strict ones -- MarineTraffic's among them --
+    /// drop the sentence, so assert the shape on the wire explicitly.
+    fn assert_encapsulation_fields(sentence: &str) {
+        let body = sentence
+            .strip_prefix('!')
+            .and_then(|s| s.split('*').next())
+            .unwrap_or_else(|| panic!("no '!' prefix or '*' checksum in {sentence:?}"));
+        let fields: Vec<&str> = body.split(',').collect();
+        assert_eq!(
+            fields.len(),
+            7,
+            "expected 7 fields (fill bits included), got {} in {sentence:?}",
+            fields.len()
+        );
+        assert_eq!(fields[6], "0", "fill bits should be 0 in {sentence:?}");
+    }
+
+    #[test]
+    fn test_generated_sentences_have_fill_bits() {
+        let m18 = Message18::new(
+            true,
+            244060807,
+            Some(0.7),
+            Some(129.847682),
+            Some(33.393043),
+            Some(264.0),
+            None,
+        );
+        assert_encapsulation_fields(&m18.to_nmea());
+
+        let m24 = Message24::new(true, 244060807, "MERRIMAC", 36, "PD2366", 16, 1, 1, 4);
+        for sentence in m24.to_nmea() {
+            assert_encapsulation_fields(&sentence);
+        }
+    }
+
     #[test]
     fn test_message24_to_nmea() {
         let message = Message24::new(true, 244123456, "MERRIMAC", 36, "PH1234", 12, 3, 2, 2);
@@ -411,6 +454,8 @@ mod tests {
         println!("Part B: {}", sentences[1]);
         assert!(sentences[0].starts_with("!AIVDO"));
         assert!(sentences[1].starts_with("!AIVDO"));
+        assert_encapsulation_fields(&sentences[0]);
+        assert_encapsulation_fields(&sentences[1]);
 
         let mut parser = nmea_parser::NmeaParser::new();
 
@@ -449,6 +494,7 @@ mod tests {
         let nmea = message.to_nmea();
         println!("Generated NMEA: {}", nmea);
         assert!(nmea.starts_with("!AIVDO"));
+        assert_encapsulation_fields(&nmea);
 
         let mut parser = nmea_parser::NmeaParser::new();
         let parsed = parser.parse_sentence(&nmea).unwrap();
